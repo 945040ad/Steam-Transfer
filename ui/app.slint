@@ -1,0 +1,604 @@
+import { Button, LineEdit, ProgressIndicator, ScrollView, TextEdit, CheckBox, Palette, AboutSlint } from "std-widgets.slint";
+
+export struct GameRow { app-id: string, name: string, meta: string, initials: string, tint: color, art: image, has-art: bool, needs-update: bool }
+export struct PeerRow { key: string, name: string, subtitle: string, glyph: string, tag: string }
+export struct DriveRow { root: string, title: string, subtitle: string, glyph: string, used: float, too-small: bool }
+export struct PackageRow { folder: string, name: string, subtitle: string, initials: string, tint: color, art: image, has-art: bool }
+export struct ChipRow { text: string, glyph: string, dot: string, action: string }
+export struct ToastRow { text: string, kind: string }
+export struct LibRow { path: string, subtitle: string }
+
+export global Theme {
+    in property <string> icon-font: "Segoe Fluent Icons";
+    in property <bool> dark: true;
+    out property <color> success: dark ? #6CCB5F : #0F7B0F;
+    out property <color> caution: dark ? #FCE100 : #9D5D00;
+    out property <color> critical: dark ? #FF99A4 : #C42B1C;
+    out property <color> secondary: dark ? #FFFFFFC8 : #000000A0;
+    out property <color> tertiary: dark ? #FFFFFF8B : #00000072;
+    out property <color> card: dark ? #FFFFFF0D : #FFFFFFB3;
+    out property <color> card-stroke: dark ? #0000001A : #0000000F;
+    out property <color> subtle: dark ? #FFFFFF0F : #00000009;
+    out property <color> layer: dark ? #3A3A3A4C : #FFFFFF80;
+    out property <color> attention-bg: dark ? #FFFFFF08 : #F6F6F680;
+    out property <color> critical-bg: dark ? #442726 : #FDE7E9;
+    out property <color> toast-bg: dark ? #2C2C2C : #F9F9F9;
+}
+
+component Glyph inherits Text {
+    font-family: Theme.icon-font;
+    vertical-alignment: center;
+    horizontal-alignment: center;
+}
+
+component Caption inherits Text {
+    font-size: 12px;
+    color: Theme.secondary;
+    overflow: elide;
+}
+
+component Card inherits Rectangle {
+    background: Theme.card;
+    border-color: Theme.card-stroke;
+    border-width: 1px;
+    border-radius: 8px;
+}
+
+component SectionHeader inherits HorizontalLayout {
+    in property <string> text;
+    in property <string> link;
+    callback link-clicked();
+    padding-top: 20px;
+    padding-bottom: 8px;
+    Text { text: root.text; font-size: 14px; font-weight: 600; vertical-alignment: center; }
+    if root.link != "": Rectangle {
+        horizontal-stretch: 0;
+        width: link-text.preferred-width;
+        link-text := Text {
+            text: root.link; font-size: 12px; font-weight: 600; color: Palette.accent-background; vertical-alignment: center;
+        }
+        TouchArea { mouse-cursor: pointer; clicked => { root.link-clicked(); } }
+    }
+}
+
+// A selectable row (PC / drive / library) with an icon tile.
+component ChoiceRow inherits Rectangle {
+    in property <string> glyph;
+    in property <string> title;
+    in property <string> subtitle;
+    in property <string> tag;
+    in property <bool> selected;
+    in property <bool> enabled: true;
+    in property <float> bar: -1;
+    callback clicked();
+    height: layout.preferred-height;
+    border-radius: 6px;
+    background: selected ? Palette.accent-background.with-alpha(0.16) : ta.has-hover && enabled ? Theme.subtle : transparent;
+    opacity: enabled ? 1 : 0.5;
+    Rectangle {
+        x: 0; width: 3px; height: 16px; border-radius: 1.5px;
+        background: Palette.accent-background;
+        visible: root.selected;
+    }
+    layout := HorizontalLayout {
+        padding: 8px; padding-left: 12px; spacing: 12px;
+        Rectangle {
+            width: 36px; height: 36px; border-radius: 6px; background: Theme.subtle;
+            Glyph { text: root.glyph; font-size: 17px; }
+        }
+        VerticalLayout {
+            alignment: center; spacing: 1px;
+            Text { text: root.title; font-weight: 600; overflow: elide; }
+            Caption { text: root.subtitle; }
+            if root.bar >= 0: Rectangle {
+                height: 3px; border-radius: 1.5px; background: Theme.subtle;
+                Rectangle { x: 0; width: parent.width * root.bar; border-radius: 1.5px; background: Palette.accent-background; }
+            }
+        }
+        if root.tag != "": Rectangle {
+            horizontal-stretch: 0;
+            width: tag-text.preferred-width + 12px; height: 18px; y: (parent.height - self.height) / 2;
+            border-radius: 4px; background: Palette.accent-background;
+            tag-text := Text { text: root.tag; font-size: 10px; font-weight: 700; color: Palette.accent-foreground; }
+        }
+    }
+    ta := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
+}
+
+component Art inherits Rectangle {
+    in property <image> art;
+    in property <bool> has-art;
+    in property <string> initials;
+    in property <color> tint;
+    in property <length> initials-size: 34px;
+    border-radius: 8px;
+    clip: true;
+    background: tint;
+    Text { text: root.initials; font-size: root.initials-size; font-weight: 700; color: #FFFFFFE6; }
+    if root.has-art: Image { width: parent.width; height: parent.height; source: root.art; image-fit: cover; }
+}
+
+export component OfferDialog inherits Window {
+    in property <string> dialog-title: "Incoming game";
+    title: dialog-title;
+    icon: @image-url("app.png");
+    width: 520px;
+    preferred-height: dlg-layout.preferred-height;
+    background: Palette.background;
+    always-on-top: true;
+    in property <string> kicker;
+    in property <string> game-title;
+    in property <string> sub;
+    in property <bool> show-existing;
+    in property <[LibRow]> libs;
+    in-out property <int> selected-lib;
+    in property <bool> show-close-steam;
+    in-out property <bool> close-steam: true;
+    in property <string> error-text;
+    in property <string> yes-text: "Accept";
+    in property <string> no-text: "Decline";
+    in property <bool> busy;
+    in property <image> hero;
+    in property <bool> has-hero;
+    in property <color> tint;
+    callback accept(int, bool);
+    callback decline();
+
+    dlg-layout := VerticalLayout {
+        Rectangle {
+            height: 160px; background: root.tint; clip: true;
+            if root.has-hero: Image { width: parent.width; height: parent.height; source: root.hero; image-fit: cover; }
+            Rectangle { background: @linear-gradient(180deg, #00000000 40%, #00000099 100%); }
+        }
+        VerticalLayout {
+            padding: 24px; padding-top: 16px; spacing: 2px;
+            Text { text: root.kicker; font-size: 12px; font-weight: 600; color: Palette.accent-background; }
+            Text { text: root.game-title; font-size: 24px; font-weight: 600; wrap: word-wrap; }
+            Caption { text: root.sub; font-size: 13px; }
+            if root.show-existing: Rectangle {
+                height: note.preferred-height + 18px;
+                border-radius: 6px; background: Theme.attention-bg; border-color: Theme.card-stroke; border-width: 1px;
+                note := HorizontalLayout {
+                    padding: 9px; padding-left: 12px; spacing: 10px;
+                    Glyph { text: "\u{E946}"; color: Palette.accent-background; width: 16px; }
+                    Text { text: "Already on this PC — only missing or changed files will be copied."; wrap: word-wrap; vertical-alignment: center; horizontal-alignment: left; horizontal-stretch: 1; }
+                }
+            }
+            Text { text: "Install to"; font-weight: 600; }
+            for lib[i] in root.libs: ChoiceRow {
+                glyph: "\u{EDA2}";
+                title: lib.path;
+                subtitle: lib.subtitle;
+                selected: i == root.selected-lib;
+                clicked => { root.selected-lib = i; }
+            }
+            if root.show-close-steam: CheckBox {
+                text: "Close Steam while copying and reopen it after (recommended)";
+                checked <=> root.close-steam;
+            }
+            if root.error-text != "": Rectangle {
+                height: err.preferred-height + 18px;
+                border-radius: 6px; background: Theme.critical-bg;
+                err := HorizontalLayout {
+                    padding: 9px; padding-left: 12px; spacing: 10px;
+                    Glyph { text: "\u{E783}"; color: Theme.critical; width: 16px; }
+                    Text { text: root.error-text; wrap: word-wrap; vertical-alignment: center; horizontal-alignment: left; horizontal-stretch: 1; }
+                }
+            }
+            HorizontalLayout {
+                padding-top: 18px; spacing: 8px; alignment: end;
+                Button { text: root.no-text; min-width: 110px; clicked => { root.decline(); } }
+                Button { text: root.yes-text; primary: true; min-width: 110px; enabled: !root.busy; clicked => { root.accept(root.selected-lib, root.close-steam); } }
+            }
+        }
+    }
+}
+
+export component AboutDialog inherits Window {
+    title: "About Steam Game Transfer";
+    icon: @image-url("app.png");
+    width: 440px;
+    preferred-height: about-layout.preferred-height;
+    background: Palette.background;
+    in property <string> version;
+    callback dismiss();
+    about-layout := VerticalLayout {
+        padding: 24px;
+        spacing: 10px;
+        HorizontalLayout {
+            spacing: 14px;
+            Image { source: @image-url("app.png"); width: 48px; height: 48px; }
+            VerticalLayout {
+                alignment: center;
+                Text { text: "Steam Game Transfer"; font-size: 20px; font-weight: 600; }
+                Caption { text: "Version " + root.version; }
+            }
+        }
+        Text {
+            text: "Copy installed Steam games between PCs over USB4/Thunderbolt, Ethernet, Wi-Fi or a USB drive, without downloading them again.";
+            wrap: word-wrap;
+        }
+        Caption { text: "© 2026. All rights reserved."; }
+        Rectangle { height: 1px; background: Theme.card-stroke; }
+        AboutSlint { }
+        HorizontalLayout {
+            alignment: end;
+            Button { text: "Close"; clicked => { root.dismiss(); } }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Steam Game Transfer";
+    icon: @image-url("app.png");
+    preferred-width: 1320px;
+    preferred-height: 860px;
+    min-width: 980px;
+    min-height: 620px;
+    background: Palette.background;
+
+    // ---- data from Rust ----
+    in property <string> machine;
+    in property <string> version;
+    in property <[ChipRow]> chips;
+    in property <bool> show-install;
+    in property <[GameRow]> games;
+    in property <string> games-count;
+    in property <string> empty-title;
+    in property <string> empty-text;
+    in property <string> selected-game;
+    in property <string> hero-title;
+    in property <string> hero-sub;
+    in property <image> hero-art;
+    in property <bool> hero-has-art;
+    in property <color> hero-tint;
+    in property <[PeerRow]> peers;
+    in property <string> selected-peer;
+    in property <bool> show-usb4-tip;
+    in property <[DriveRow]> drives;
+    in property <string> selected-drive;
+    in property <[PackageRow]> packages;
+    in property <bool> packages-enabled: true;
+    in property <string> summary: "Pick a game to send.";
+    in property <string> go-text: "Send";
+    in property <bool> go-enabled;
+    // transfer
+    in property <bool> transfer-visible;
+    in property <string> t-title;
+    in property <string> t-stats;
+    in property <string> t-state; // "", paused, waiting, ok, error, cancelled
+    in property <string> t-percent;
+    in property <float> t-progress;
+    in property <bool> t-indeterminate;
+    in property <string> t-file;
+    in property <bool> t-paused;
+    in property <bool> t-running;
+    in property <string> log-text;
+    in property <string> last-log: "Ready.";
+    in property <[ToastRow]> toasts;
+
+    // ---- actions to Rust ----
+    callback select-game(string);
+    callback select-peer(string);
+    callback select-drive(string);
+    callback search(string);
+    callback refresh();
+    callback add-peer(string);
+    callback go();
+    callback browse-export();
+    callback browse-import();
+    callback import-package(string);
+    callback pause();
+    callback resume();
+    callback cancel();
+    callback close-transfer();
+    callback install();
+    callback hide-install();
+    callback chip-action(string);
+    callback about();
+
+    property <bool> log-open;
+
+    VerticalLayout {
+        // ===== status strip =====
+        HorizontalLayout {
+            padding-left: 20px; padding-right: 20px; padding-top: 14px; padding-bottom: 6px; spacing: 8px;
+            for c in root.chips: Rectangle {
+                horizontal-stretch: 0;
+                height: 26px;
+                width: chip-layout.preferred-width;
+                border-radius: 13px;
+                background: chip-ta.has-hover && c.action != "" ? Theme.subtle : Theme.card;
+                border-color: Theme.card-stroke; border-width: 1px;
+                chip-layout := HorizontalLayout {
+                    padding-left: 10px; padding-right: 10px; spacing: 6px;
+                    if c.glyph != "": Glyph { text: c.glyph; font-size: 12px; color: Palette.accent-background; }
+                    if c.glyph == "": Rectangle {
+                        width: 8px;
+                        Rectangle {
+                            width: 8px; height: 8px; border-radius: 4px;
+                            background: c.dot == "ok" ? Theme.success : c.dot == "warn" ? Theme.caution : c.dot == "err" ? Theme.critical : Theme.tertiary;
+                        }
+                    }
+                    Text { text: c.text; font-size: 12px; vertical-alignment: center; }
+                }
+                chip-ta := TouchArea {
+                    mouse-cursor: c.action != "" ? pointer : default;
+                    clicked => { if (c.action != "") { root.chip-action(c.action); } }
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Glyph { text: "\u{E977}"; color: Theme.secondary; horizontal-stretch: 0; }
+            Text { text: root.machine; font-weight: 600; vertical-alignment: center; horizontal-stretch: 0; }
+        }
+
+        // ===== install info bar =====
+        if root.show-install: Rectangle {
+            height: 56px;
+            Card {
+                x: 20px; width: parent.width - 40px; y: 6px; height: parent.height - 10px;
+                background: Theme.attention-bg;
+                HorizontalLayout {
+                    padding-left: 14px; padding-right: 10px; spacing: 12px;
+                    Glyph { text: "\u{E946}"; font-size: 16px; color: Palette.accent-background; horizontal-stretch: 0; }
+                    Text {
+                        text: "Install Game Transfer on this PC? Adds Start menu and desktop shortcuts and sets up the firewall so other PCs can connect.";
+                        vertical-alignment: center; overflow: elide; horizontal-stretch: 1;
+                    }
+                    VerticalLayout { alignment: center; horizontal-stretch: 0; Button { text: "Install"; primary: true; min-width: 100px; clicked => { root.install(); } } }
+                    VerticalLayout { alignment: center; horizontal-stretch: 0; Button { text: "Not now"; clicked => { root.hide-install(); } } }
+                }
+            }
+        }
+
+        // ===== main =====
+        HorizontalLayout {
+            vertical-stretch: 1;
+            padding-top: 8px;
+
+            // ---- games ----
+            VerticalLayout {
+                padding-left: 20px; padding-right: 8px; padding-bottom: 12px; spacing: 12px;
+                HorizontalLayout {
+                    padding-right: 12px; spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Text { text: "Your games"; font-size: 20px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 0; }
+                        Text { text: root.games-count; font-size: 14px; color: Theme.tertiary; vertical-alignment: center; horizontal-stretch: 0; }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    LineEdit { width: 260px; horizontal-stretch: 0; placeholder-text: "Search games"; edited(t) => { root.search(t); } }
+                    Button { text: "Refresh"; horizontal-stretch: 0; clicked => { root.refresh(); } }
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    games-view := ScrollView {
+                        property <length> cell-w: 168px;
+                        property <length> cell-h: 292px;
+                        property <int> cols: Math.max(1, Math.floor(self.visible-width / self.cell-w));
+                        content-width: self.visible-width;
+                        content-height: Math.ceil(root.games.length / self.cols) * self.cell-h;
+                        for g[i] in root.games: Rectangle {
+                            x: Math.mod(i, games-view.cols) * games-view.cell-w;
+                            y: Math.floor(i / games-view.cols) * games-view.cell-h;
+                            width: games-view.cell-w;
+                            height: games-view.cell-h;
+                            Art {
+                                x: 8px; y: tile-ta.has-hover && root.selected-game != g.app-id ? 2px : 6px;
+                                width: 152px; height: 228px;
+                                art: g.art; has-art: g.has-art; initials: g.initials; tint: g.tint;
+                                animate y { duration: 120ms; }
+                            }
+                            Rectangle {
+                                x: 5px; y: 3px; width: 158px; height: 234px; border-radius: 10px;
+                                border-width: root.selected-game == g.app-id ? 3px : 0px; border-color: Palette.accent-background;
+                            }
+                            if g.needs-update: Rectangle {
+                                x: 16px; y: 14px; width: 52px; height: 16px; border-radius: 4px; background: Theme.caution;
+                                Text { text: "UPDATE"; font-size: 10px; font-weight: 700; color: black; }
+                            }
+                            if root.selected-game == g.app-id: Rectangle {
+                                x: 128px; y: 14px; width: 24px; height: 24px; border-radius: 12px; background: Palette.accent-background;
+                                Glyph { text: "\u{E73E}"; font-size: 12px; color: Palette.accent-foreground; }
+                            }
+                            Text { x: 10px; y: 242px; width: 148px; text: g.name; font-weight: 600; overflow: elide; }
+                            Caption { x: 10px; y: 262px; width: 148px; text: g.meta; }
+                            tile-ta := TouchArea { clicked => { root.select-game(g.app-id); } }
+                        }
+                    }
+                    if root.games.length == 0: VerticalLayout {
+                        alignment: center; spacing: 6px;
+                        Glyph { text: "\u{E7FC}"; font-size: 40px; color: Theme.tertiary; }
+                        Text { text: root.empty-title; font-size: 16px; font-weight: 600; horizontal-alignment: center; }
+                        Caption { text: root.empty-text; horizontal-alignment: center; }
+                    }
+                }
+            }
+
+            // ---- side panel ----
+            Rectangle {
+                width: 400px;
+                background: Theme.layer;
+                border-radius: 8px;
+                border-color: Theme.card-stroke; border-width: 1px;
+                VerticalLayout {
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            padding: 18px; padding-bottom: 8px;
+                            // selected game
+                            Rectangle {
+                                height: 150px; border-radius: 8px; clip: true;
+                                background: root.selected-game == "" ? Theme.card : root.hero-tint;
+                                border-color: Theme.card-stroke; border-width: root.selected-game == "" ? 1px : 0px;
+                                if root.selected-game == "": Text { text: "Pick a game on the left"; color: Theme.secondary; }
+                                if root.selected-game != "" && root.hero-has-art: Image {
+                                    width: parent.width; height: parent.height; source: root.hero-art; image-fit: cover;
+                                }
+                                if root.selected-game != "": Rectangle {
+                                    background: @linear-gradient(180deg, #00000000 25%, #000000E0 100%);
+                                    VerticalLayout {
+                                        padding: 14px; alignment: end;
+                                        Text { text: root.hero-title; font-size: 18px; font-weight: 600; color: white; overflow: elide; }
+                                        Text { text: root.hero-sub; font-size: 12px; color: #FFFFFFD0; overflow: elide; }
+                                    }
+                                }
+                            }
+
+                            SectionHeader { text: "Send to a PC"; }
+                            for p in root.peers: ChoiceRow {
+                                glyph: p.glyph; title: p.name; subtitle: p.subtitle; tag: p.tag;
+                                selected: root.selected-peer == p.key;
+                                clicked => { root.select-peer(p.key); }
+                            }
+                            if root.peers.length == 0: Card {
+                                height: tips.preferred-height;
+                                tips := VerticalLayout {
+                                    padding: 14px; spacing: 8px;
+                                    Text { text: "Looking for other PCs…"; font-weight: 600; }
+                                    ProgressIndicator { indeterminate: true; height: 4px; }
+                                    Caption { text: "Open Game Transfer on the other PC, then connect them with any of these:"; wrap: word-wrap; overflow: clip; }
+                                    if root.show-usb4-tip: HorizontalLayout {
+                                        spacing: 10px;
+                                        Glyph { text: "\u{E945}"; width: 18px; color: Palette.accent-background; }
+                                        Text { text: "USB4 / Thunderbolt cable — fastest, up to 40 Gbps. Use the ⚡ ports on both PCs."; font-size: 12px; wrap: word-wrap; }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 10px;
+                                        Glyph { text: "\u{E839}"; width: 18px; color: Palette.accent-background; }
+                                        Text { text: "Ethernet cable — PC to PC or through your router. No setup needed."; font-size: 12px; wrap: word-wrap; }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 10px;
+                                        Glyph { text: "\u{E701}"; width: 18px; color: Theme.caution; }
+                                        Text { text: "Same Wi-Fi — works, but much slower."; font-size: 12px; wrap: word-wrap; }
+                                    }
+                                    Caption { text: "A direct cable can take up to a minute to connect."; }
+                                }
+                            }
+                            HorizontalLayout {
+                                padding-top: 10px; spacing: 8px;
+                                ip-edit := LineEdit {
+                                    placeholder-text: "Not listed? Type its IP address";
+                                    accepted(t) => { root.add-peer(t); self.text = ""; }
+                                }
+                                Button { text: "Add"; horizontal-stretch: 0; clicked => { root.add-peer(ip-edit.text); ip-edit.text = ""; } }
+                            }
+
+                            SectionHeader { text: "Copy to a drive"; link: "Other folder…"; link-clicked => { root.browse-export(); } }
+                            for d in root.drives: ChoiceRow {
+                                glyph: d.glyph; title: d.title; subtitle: d.subtitle; bar: d.used;
+                                enabled: !d.too-small;
+                                selected: root.selected-drive == d.root;
+                                clicked => { root.select-drive(d.root); }
+                            }
+                            if root.drives.length == 0: Caption { text: "Plug in a USB drive or external SSD to copy a game onto it."; wrap: word-wrap; overflow: clip; }
+
+                            SectionHeader { text: "Install from a drive"; link: "Browse…"; link-clicked => { root.browse-import(); } }
+                            for pk in root.packages: Card {
+                                height: 76px;
+                                HorizontalLayout {
+                                    padding: 8px; spacing: 12px;
+                                    Art { width: 40px; height: 60px; border-radius: 4px; initials-size: 14px; art: pk.art; has-art: pk.has-art; initials: pk.initials; tint: pk.tint; }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Text { text: pk.name; font-weight: 600; overflow: elide; }
+                                        Caption { text: pk.subtitle; }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Button { text: "Install"; enabled: root.packages-enabled; clicked => { root.import-package(pk.folder); } }
+                                    }
+                                }
+                            }
+                            if root.packages.length == 0: Caption { text: "Games copied to a drive with this app show up here when you plug the drive in."; wrap: word-wrap; overflow: clip; }
+                        }
+                    }
+                    // action
+                    Rectangle { height: 1px; background: Theme.card-stroke; }
+                    VerticalLayout {
+                        padding: 18px; padding-top: 12px; spacing: 10px;
+                        Caption { text: root.summary; wrap: word-wrap; overflow: clip; }
+                        Button { text: root.go-text; primary: true; enabled: root.go-enabled; height: 40px; clicked => { root.go(); } }
+                    }
+                }
+            }
+        }
+
+        // ===== transfer =====
+        if root.transfer-visible: Rectangle {
+            height: t-card-layout.preferred-height + 16px;
+            Card {
+                x: 20px; y: 10px; width: parent.width - 40px; height: parent.height - 14px;
+                t-card-layout := VerticalLayout {
+                    padding: 16px; padding-top: 12px; padding-bottom: 12px; spacing: 6px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            alignment: center;
+                            Text { text: root.t-title; font-size: 14px; font-weight: 600; overflow: elide; }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                property <color> c: root.t-state == "waiting" || root.t-state == "error" ? Theme.critical : root.t-state == "paused" ? Theme.caution : root.t-state == "ok" ? Theme.success : Theme.secondary;
+                                if root.t-state != "": Glyph {
+                                    horizontal-stretch: 0; font-size: 13px; color: parent.c;
+                                    text: root.t-state == "paused" ? "\u{E769}" : root.t-state == "ok" ? "\u{E73E}" : root.t-state == "cancelled" ? "\u{E711}" : "\u{E7BA}";
+                                }
+                                Caption { text: root.t-stats; color: parent.c; }
+                            }
+                        }
+                        Text { text: root.t-percent; font-size: 22px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 0; min-width: 64px; horizontal-alignment: right; }
+                        if root.t-running && !root.t-paused: VerticalLayout { alignment: center; Button { text: "Pause"; clicked => { root.pause(); } } }
+                        if root.t-running && root.t-paused: VerticalLayout { alignment: center; Button { text: "Resume"; primary: true; clicked => { root.resume(); } } }
+                        if root.t-running: VerticalLayout { alignment: center; Button { text: "Cancel"; clicked => { root.cancel(); } } }
+                        if !root.t-running: VerticalLayout { alignment: center; Button { text: "Close"; clicked => { root.close-transfer(); } } }
+                    }
+                    ProgressIndicator { progress: root.t-progress; indeterminate: root.t-indeterminate; height: 6px; }
+                    Caption { text: root.t-file; font-size: 11px; color: Theme.tertiary; font-family: "Cascadia Mono"; }
+                }
+            }
+        }
+
+        // ===== activity log =====
+        if root.log-open: Rectangle {
+            height: 200px;
+            Card {
+                x: 20px; y: 6px; width: parent.width - 40px; height: parent.height - 10px;
+                TextEdit { text: root.log-text; read-only: true; font-size: 12px; font-family: "Cascadia Mono"; wrap: word-wrap; }
+            }
+        }
+
+        // ===== status bar =====
+        HorizontalLayout {
+            padding-left: 20px; padding-right: 20px; padding-top: 4px; padding-bottom: 8px; spacing: 10px;
+            Button { text: root.log-open ? "Hide activity" : "Activity"; horizontal-stretch: 0; checkable: true; checked: root.log-open; clicked => { root.log-open = !root.log-open; } }
+            Button { text: "About"; horizontal-stretch: 0; clicked => { root.about(); } }
+            Caption { text: root.last-log; vertical-alignment: center; horizontal-stretch: 1; }
+            Caption { text: root.version; vertical-alignment: center; horizontal-stretch: 0; horizontal-alignment: right; }
+        }
+    }
+
+    // ===== notifications =====
+    VerticalLayout {
+        x: parent.width - 404px;
+        y: parent.height - self.preferred-height - 60px;
+        width: 380px;
+        spacing: 6px;
+        for t in root.toasts: Rectangle {
+            height: toast-layout.preferred-height;
+            border-radius: 8px;
+            background: Theme.toast-bg;
+            border-color: Theme.card-stroke; border-width: 1px;
+            drop-shadow-blur: 18px; drop-shadow-color: #00000050; drop-shadow-offset-y: 3px;
+            toast-layout := HorizontalLayout {
+                padding: 12px; padding-left: 14px; spacing: 12px;
+                Glyph {
+                    horizontal-stretch: 0; font-size: 16px; vertical-alignment: top;
+                    text: t.kind == "ok" ? "\u{E73E}" : t.kind == "error" ? "\u{E783}" : "\u{E946}";
+                    color: t.kind == "ok" ? Theme.success : t.kind == "error" ? Theme.critical : Palette.accent-background;
+                }
+                Text { text: t.text; wrap: word-wrap; }
+            }
+        }
+    }
+}

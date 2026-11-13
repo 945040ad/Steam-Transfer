@@ -1,0 +1,15 @@
+# Rust build output
+/target/
+/dist/
+
+# Legacy C# build output
+/legacy/bin/
+/legacy/obj/
+/legacy/publish/
+
+# Editors / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store

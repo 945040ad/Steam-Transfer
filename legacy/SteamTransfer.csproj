@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>SteamTransfer</AssemblyName>
+    <RootNamespace>SteamTransfer</RootNamespace>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>1.1.0</Version>
+    <Product>Steam Game Transfer</Product>
+    <!-- WPF's built-in Windows 11 (Fluent) theme is marked experimental; we opt in. -->
+    <NoWarn>$(NoWarn);WPF0001</NoWarn>
+    <!-- Single self-contained exe: copy it to the other PC and run, nothing to install. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>none</DebugType>
+    <AllowedReferenceRelatedFileExtensions>-</AllowedReferenceRelatedFileExtensions>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="app.ico" />
+    <Using Include="System.IO" />
+    <PackageReference Include="System.Management" Version="11.0.0" />
+  </ItemGroup>
+
+</Project>
