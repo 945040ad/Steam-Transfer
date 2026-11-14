@@ -1,6 +1,7 @@
-import { Button, LineEdit, ProgressIndicator, ScrollView, TextEdit, CheckBox, Palette, AboutSlint } from "std-widgets.slint";
+import { Button, LineEdit, ProgressIndicator, ScrollView, TextEdit, CheckBox, Palette, AboutSlint, Switch } from "std-widgets.slint";
 
-export struct GameRow { app-id: string, name: string, meta: string, initials: string, tint: color, art: image, has-art: bool, needs-update: bool }
+export struct GameRow { app-id: string, name: string, meta: string, initials: string, tint: color, art: image, has-art: bool, needs-update: bool, badge: string, badge-color: color }
+export struct FilterRow { id: string, label: string }
 export struct PeerRow { key: string, name: string, subtitle: string, glyph: string, tag: string }
 export struct DriveRow { root: string, title: string, subtitle: string, glyph: string, used: float, too-small: bool }
 export struct PackageRow { folder: string, name: string, subtitle: string, initials: string, tint: color, art: image, has-art: bool }
@@ -23,6 +24,158 @@ export global Theme {
     out property <color> attention-bg: dark ? #FFFFFF08 : #F6F6F680;
     out property <color> critical-bg: dark ? #442726 : #FDE7E9;
     out property <color> toast-bg: dark ? #2C2C2C : #F9F9F9;
+    /// The Windows accent colour as a plain colour (Palette's accent is a brush, which can't drive glows/gradients).
+    in property <color> accent: #60CDFF;
+}
+
+// ================= motion =================
+// One-shot animations play when an element appears or changes; looping ones (radar, progress sheen) only exist
+// while something is actually happening, so an idle window doesn't keep redrawing.
+
+/// Fades its content in while it rises (or slides) into place. Stagger lists with `delay`.
+component Reveal inherits Rectangle {
+    in property <duration> delay: 0ms;
+    in property <length> rise: 14px;
+    in property <length> slide: 0px;
+    in property <duration> duration: 460ms;
+    property <bool> shown: false;
+    init => { self.shown = true; }
+    Rectangle {
+        x: root.shown ? 0px : root.slide;
+        y: root.shown ? 0px : root.rise;
+        width: parent.width;
+        height: parent.height;
+        opacity: root.shown ? 1 : 0;
+        animate x, y { duration: root.duration; delay: root.delay; easing: ease-out-quint; }
+        animate opacity { duration: root.duration * 0.7; delay: root.delay; easing: ease-out-quart; }
+        @children
+    }
+}
+
+/// Easing curves for the looping animations (property animations use Slint's built-in curves).
+/// Nothing moves at a constant speed: things accelerate away, decelerate into place, and fade with the motion.
+global Ease {
+    /// fast start, gentle stop — things arriving / expanding
+    public pure function out-cubic(t: float) -> float {
+        return 1 - Math.pow(1 - Math.clamp(t, 0, 1), 3);
+    }
+    /// accelerate then decelerate — things travelling from A to B
+    public pure function in-out-cubic(t: float) -> float {
+        let x = Math.clamp(t, 0, 1);
+        return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+    }
+    public pure function in-out-sine(t: float) -> float {
+        return (1 - Math.cos(Math.clamp(t, 0, 1) * 180deg)) / 2;
+    }
+    /// 0 → 1 → 0 over the cycle, smooth at both ends — fade in and out, grow and shrink
+    public pure function bump(t: float) -> float {
+        return Math.sin(Math.clamp(t, 0, 1) * 180deg);
+    }
+    /// seamless 0 → 1 → 0 loop for breathing / pulsing
+    public pure function breathe(t: float) -> float {
+        return (1 - Math.cos(t * 360deg)) / 2;
+    }
+}
+
+/// Sonar rings around a breathing dot: "searching". Rings burst out quickly, slow down as they spread, and fade away.
+component Radar {
+    width: 52px;
+    height: 52px;
+    property <float> clock: Math.mod(animation-tick() / 1ms, 2700) / 2700;
+    for k in 3: Rectangle {
+        property <float> t: Math.mod(root.clock + k / 3, 1);
+        property <float> spread: Ease.out-cubic(self.t);
+        width: 12px + self.spread * 40px;
+        height: self.width;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        border-radius: self.width / 2;
+        border-width: 2.5px - self.spread * 1.5px;
+        border-color: Theme.accent.with-alpha(Math.pow(1 - self.t, 1.7) * 0.9);
+    }
+    Rectangle {
+        property <float> b: Ease.breathe(Math.mod(animation-tick() / 1ms, 2700) / 2700);
+        width: 12px; height: 12px; border-radius: 6px;
+        x: (root.width - self.width) / 2; y: (root.height - self.height) / 2;
+        background: Theme.accent;
+        transform-origin: { x: self.width / 2, y: self.height / 2 };
+        transform-scale-x: 88% + self.b * 22%;
+        transform-scale-y: 88% + self.b * 22%;
+        drop-shadow-blur: 6px + self.b * 8px; drop-shadow-color: Theme.accent.with-alpha(0.45 + 0.35 * self.b);
+    }
+}
+
+/// Progress track: smooth fill, colour follows state, a light sheen sweeps across while data is moving.
+component Progress inherits Rectangle {
+    in property <float> progress;
+    in property <bool> indeterminate;
+    in property <bool> moving;
+    in property <color> tone: Theme.accent;
+    height: 8px;
+    border-radius: 4px;
+    background: Theme.subtle;
+    clip: true;
+    fill := Rectangle {
+        x: 0;
+        height: parent.height;
+        width: root.indeterminate || root.progress <= 0 ? 0px : Math.max(parent.height, parent.width * Math.min(root.progress, 1));
+        border-radius: parent.border-radius;
+        background: root.tone;
+        animate width { duration: 700ms; easing: ease-out-quart; }
+        animate background { duration: 450ms; easing: ease-in-out-sine; }
+        Rectangle { background: @linear-gradient(180deg, #FFFFFF30 0%, #FFFFFF00 100%); border-radius: parent.border-radius; }
+        // a sheen glides across (accelerates, then eases out), rests, and goes again
+        if root.moving: Rectangle {
+            property <float> cycle: Math.mod(animation-tick() / 1ms, 2600) / 2600;
+            property <float> run: Math.min(1, self.cycle / 0.62);
+            width: 140px;
+            x: -140px + Ease.in-out-cubic(self.run) * (parent.width + 280px);
+            opacity: self.cycle < 0.62 ? Ease.bump(self.run) : 0;
+            background: @linear-gradient(90deg, #FFFFFF00 0%, #FFFFFF70 50%, #FFFFFF00 100%);
+        }
+    }
+    // unknown length: a segment sweeps across, stretching in the middle of its run and easing at the ends
+    if root.indeterminate: Rectangle {
+        property <float> cycle: Math.mod(animation-tick() / 1ms, 1800) / 1800;
+        width: parent.width * (0.12 + 0.3 * Ease.bump(self.cycle));
+        x: -self.width + Ease.in-out-cubic(self.cycle) * (parent.width + self.width);
+        border-radius: parent.border-radius;
+        background: @linear-gradient(90deg, root.tone.with-alpha(0) 0%, root.tone 50%, root.tone.with-alpha(0) 100%);
+    }
+}
+
+/// The main call-to-action: accent fill with a soft top sheen, glows and lifts on hover, presses in.
+component PrimaryButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked();
+    property <bool> hot: ta.has-hover && root.enabled;
+    height: 44px;
+    border-radius: 8px;
+    background: root.enabled ? Theme.accent : Theme.subtle;
+    animate background { duration: 260ms; easing: ease-in-out-sine; }
+    drop-shadow-blur: root.hot ? 24px : root.enabled ? 10px : 0px;
+    drop-shadow-offset-y: root.hot ? 6px : 2px;
+    drop-shadow-color: Theme.accent.with-alpha(root.enabled ? 0.55 : 0);
+    animate drop-shadow-blur, drop-shadow-offset-y, drop-shadow-color { duration: 260ms; easing: ease-out-quart; }
+    transform-origin: { x: self.width / 2, y: self.height / 2 };
+    transform-scale-x: ta.pressed ? 97.5% : 100%;
+    transform-scale-y: ta.pressed ? 97.5% : 100%;
+    animate transform-scale-x, transform-scale-y { duration: 140ms; easing: ease-out-back; }
+    Rectangle {
+        border-radius: parent.border-radius;
+        background: @linear-gradient(180deg, #FFFFFF38 0%, #FFFFFF00 60%);
+        opacity: root.enabled ? (root.hot ? 1 : 0.7) : 0;
+        animate opacity { duration: 260ms; easing: ease-out-quart; }
+    }
+    Text {
+        text: root.text;
+        font-size: 15px;
+        font-weight: 600;
+        color: root.enabled ? (Theme.dark ? #000000E0 : #FFFFFF) : Theme.tertiary;
+        overflow: elide;
+    }
+    ta := TouchArea { enabled: root.enabled; mouse-cursor: root.enabled ? pointer : default; clicked => { root.clicked(); } }
 }
 
 component Glyph inherits Text {
@@ -74,11 +227,20 @@ component ChoiceRow inherits Rectangle {
     height: layout.preferred-height;
     border-radius: 6px;
     background: selected ? Palette.accent-background.with-alpha(0.16) : ta.has-hover && enabled ? Theme.subtle : transparent;
-    opacity: enabled ? 1 : 0.5;
+    animate background { duration: 180ms; easing: ease-out-quart; }
+    // rows fade in when they appear (a PC is found, a drive is plugged in)
+    property <bool> shown: false;
+    init => { self.shown = true; }
+    opacity: (self.shown ? 1 : 0) * (enabled ? 1 : 0.5);
+    animate opacity { duration: 450ms; easing: ease-out-quart; }
+    // selection indicator grows out of the middle with a little spring
     Rectangle {
-        x: 0; width: 3px; height: 16px; border-radius: 1.5px;
+        x: 0; width: 3px;
+        height: root.selected ? 18px : 0px;
+        y: (parent.height - self.height) / 2;
+        border-radius: 1.5px;
         background: Palette.accent-background;
-        visible: root.selected;
+        animate height { duration: 320ms; easing: ease-out-back; }
     }
     layout := HorizontalLayout {
         padding: 8px; padding-left: 12px; spacing: 12px;
@@ -118,6 +280,123 @@ component Art inherits Rectangle {
     if root.has-art: Image { width: parent.width; height: parent.height; source: root.art; image-fit: cover; }
 }
 
+component Endpoint inherits HorizontalLayout {
+    in property <string> glyph;
+    in property <string> label;
+    in property <color> tone;
+    horizontal-stretch: 0;
+    spacing: 8px;
+    Rectangle {
+        width: 32px; height: 32px; border-radius: 8px;
+        background: root.tone.with-alpha(0.16);
+        border-color: root.tone.with-alpha(0.35); border-width: 1px;
+        Glyph { text: root.glyph; font-size: 15px; color: root.tone; }
+    }
+    Text { text: root.label; font-weight: 600; vertical-alignment: center; overflow: elide; max-width: 170px; }
+}
+
+/// "This PC ━━ • • • ━━▶ Other PC": endpoints with a track where dots flow while data moves.
+component RouteFlow inherits Rectangle {
+    in property <string> from;
+    in property <string> to;
+    in property <string> from-glyph;
+    in property <string> to-glyph;
+    in property <string> link;
+    in property <bool> moving;
+    in property <color> tone: Theme.accent;
+    height: 40px;
+    HorizontalLayout {
+        spacing: 12px;
+        Endpoint { glyph: root.from-glyph; label: root.from; tone: root.tone; }
+        track := Rectangle {
+            horizontal-stretch: 1;
+            // base line
+            Rectangle { y: (parent.height - 2px) / 2; height: 2px; border-radius: 1px; background: Theme.subtle; }
+            // lit line, brighter towards the destination
+            Rectangle {
+                y: (parent.height - 2px) / 2; height: 2px; border-radius: 1px;
+                background: @linear-gradient(90deg, root.tone.with-alpha(0.15) 0%, root.tone.with-alpha(root.moving ? 0.7 : 0.25) 100%);
+                animate background { duration: 500ms; easing: ease-in-out-sine; }
+            }
+            // packets: each one speeds up leaving the source, glides, and slows arriving — growing and glowing mid-way,
+            // fading at both ends. Staggered, so the eased motion reads as a natural stream rather than a conveyor belt.
+            if root.moving: Rectangle {
+                property <float> clock: Math.mod(animation-tick() / 1ms, 2200) / 2200;
+                for k in 6: Rectangle {
+                    property <float> t: Math.mod(parent.clock + k / 6, 1);
+                    property <float> b: Ease.bump(self.t);
+                    width: 4px + self.b * 6px; height: self.width; border-radius: self.width / 2;
+                    x: Ease.in-out-sine(self.t) * (parent.width - 16px) + 8px - self.width / 2;
+                    y: (parent.height - self.height) / 2;
+                    background: root.tone;
+                    opacity: Math.pow(self.b, 0.7);
+                    drop-shadow-blur: 4px + self.b * 8px; drop-shadow-color: root.tone.with-alpha(0.85 * self.b);
+                }
+            }
+            // arrow head
+            Glyph {
+                x: parent.width - 10px; width: 14px; y: 0; height: parent.height;
+                text: "\u{E76C}"; font-size: 12px; color: root.tone;
+            }
+            // connection label
+            Rectangle {
+                y: -4px; height: 16px; x: (parent.width - self.width) / 2;
+                width: link-text.preferred-width + 14px;
+                border-radius: 8px; background: Theme.toast-bg;
+                link-text := Text { text: root.link; font-size: 10px; font-weight: 600; color: Theme.secondary; }
+            }
+        }
+        Endpoint { glyph: root.to-glyph; label: root.to; tone: root.tone; }
+    }
+}
+
+/// A labelled number: small caps label, big value, optional sub-line.
+component Stat inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <string> sub;
+    in property <bool> big;
+    in property <brush> tone: Palette.foreground;
+    spacing: 1px;
+    Text { text: root.label; font-size: 10px; font-weight: 700; color: Theme.tertiary; letter-spacing: 0.8px; }
+    Text { text: root.value; font-size: root.big ? 26px : 18px; font-weight: 700; color: root.tone; overflow: elide; }
+    if root.sub != "": Caption { text: root.sub; font-size: 11px; }
+}
+
+/// The last minute of transfer speed, newest on the right.
+component SpeedGraph inherits Rectangle {
+    in property <string> line;
+    in property <string> fill;
+    in property <color> tone: Theme.accent;
+    in property <bool> live;
+    border-radius: 8px;
+    background: Theme.subtle;
+    clip: true;
+    for k in 3: Rectangle { y: parent.height * (k + 1) / 4; height: 1px; background: Theme.card-stroke; }
+    Path {
+        width: parent.width; height: parent.height;
+        viewbox-width: 380; viewbox-height: 74;
+        commands: root.fill;
+        fill: @linear-gradient(180deg, root.tone.with-alpha(0.38) 0%, root.tone.with-alpha(0.02) 100%);
+        stroke-width: 0px;
+    }
+    Path {
+        width: parent.width; height: parent.height;
+        viewbox-width: 380; viewbox-height: 74;
+        commands: root.line;
+        stroke: root.tone;
+        stroke-width: 2px;
+    }
+    // a pulsing dot on the newest point while live
+    if root.live: Rectangle {
+        property <float> pulse: (Math.sin(animation-tick() / 1ms * 0.008 * 1rad) + 1) / 2;
+        x: parent.width - 7px; y: 3px; width: 6px; height: 6px; border-radius: 3px;
+        background: root.tone;
+        opacity: 0.5 + 0.5 * self.pulse;
+    }
+    Text { x: 8px; y: 4px; text: "LAST MINUTE"; font-size: 9px; font-weight: 700; color: Theme.tertiary; }
+}
+
 export component OfferDialog inherits Window {
     in property <string> dialog-title: "Incoming game";
     title: dialog-title;
@@ -138,6 +417,9 @@ export component OfferDialog inherits Window {
     in property <string> yes-text: "Accept";
     in property <string> no-text: "Decline";
     in property <bool> busy;
+    in property <string> note;
+    in property <bool> show-browse;
+    callback browse();
     in property <image> hero;
     in property <bool> has-hero;
     in property <color> tint;
@@ -147,7 +429,17 @@ export component OfferDialog inherits Window {
     dlg-layout := VerticalLayout {
         Rectangle {
             height: 160px; background: root.tint; clip: true;
-            if root.has-hero: Image { width: parent.width; height: parent.height; source: root.hero; image-fit: cover; }
+            if root.has-hero: Image {
+                property <bool> settled: false;
+                init => { self.settled = true; }
+                width: parent.width; height: parent.height; source: root.hero; image-fit: cover;
+                opacity: self.settled ? 1 : 0;
+                transform-origin: { x: self.width / 2, y: self.height / 2 };
+                transform-scale-x: self.settled ? 100% : 115%;
+                transform-scale-y: self.settled ? 100% : 115%;
+                animate transform-scale-x, transform-scale-y { duration: 1600ms; easing: ease-out-quint; }
+                animate opacity { duration: 600ms; easing: ease-out-quart; }
+            }
             Rectangle { background: @linear-gradient(180deg, #00000000 40%, #00000099 100%); }
         }
         VerticalLayout {
@@ -164,7 +456,15 @@ export component OfferDialog inherits Window {
                     Text { text: "Already on this PC — only missing or changed files will be copied."; wrap: word-wrap; vertical-alignment: center; horizontal-alignment: left; horizontal-stretch: 1; }
                 }
             }
-            Text { text: "Install to"; font-weight: 600; }
+            HorizontalLayout {
+                Text { text: "Install to"; font-weight: 600; vertical-alignment: center; }
+                if root.show-browse: Rectangle {
+                    horizontal-stretch: 0;
+                    width: browse-text.preferred-width;
+                    browse-text := Text { text: "Browse…"; font-size: 12px; font-weight: 600; color: Palette.accent-background; vertical-alignment: center; }
+                    TouchArea { mouse-cursor: pointer; clicked => { root.browse(); } }
+                }
+            }
             for lib[i] in root.libs: ChoiceRow {
                 glyph: "\u{EDA2}";
                 title: lib.path;
@@ -172,6 +472,7 @@ export component OfferDialog inherits Window {
                 selected: i == root.selected-lib;
                 clicked => { root.selected-lib = i; }
             }
+            if root.note != "": Caption { text: root.note; wrap: word-wrap; overflow: clip; }
             if root.show-close-steam: CheckBox {
                 text: "Close Steam while copying and reopen it after (recommended)";
                 checked <=> root.close-steam;
@@ -190,6 +491,48 @@ export component OfferDialog inherits Window {
                 Button { text: root.no-text; min-width: 110px; clicked => { root.decline(); } }
                 Button { text: root.yes-text; primary: true; min-width: 110px; enabled: !root.busy; clicked => { root.accept(root.selected-lib, root.close-steam); } }
             }
+        }
+    }
+}
+
+export component SettingsDialog inherits Window {
+    title: "Settings";
+    icon: @image-url("app.png");
+    width: 480px;
+    preferred-height: settings-layout.preferred-height;
+    background: Palette.background;
+    in-out property <bool> keep-app: true;
+    callback changed();
+    callback dismiss();
+    settings-layout := VerticalLayout {
+        padding: 24px;
+        spacing: 14px;
+        Text { text: "Settings"; font-size: 20px; font-weight: 600; }
+        Rectangle {
+            height: keep-row.preferred-height;
+            border-radius: 8px;
+            background: Theme.card;
+            border-color: Theme.card-stroke; border-width: 1px;
+            keep-row := HorizontalLayout {
+                padding: 14px; spacing: 16px;
+                VerticalLayout {
+                    spacing: 4px;
+                    Text { text: "Keep the app on drives"; font-weight: 600; }
+                    Caption {
+                        text: "Whenever a game is copied to or installed from a drive, make sure a working copy of SteamTransfer.exe is on it too — even if someone deleted it or moved it off the drive — so the next person can run it straight from the drive.";
+                        wrap: word-wrap; overflow: clip;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    Switch { checked <=> root.keep-app; toggled => { root.changed(); } }
+                }
+            }
+        }
+        HorizontalLayout {
+            alignment: end;
+            Button { text: "Close"; clicked => { root.dismiss(); } }
         }
     }
 }
@@ -243,6 +586,8 @@ export component MainWindow inherits Window {
     in property <[ChipRow]> chips;
     in property <bool> show-install;
     in property <[GameRow]> games;
+    in property <[FilterRow]> filters;
+    in property <string> selected-filter: "all";
     in property <string> games-count;
     in property <string> empty-title;
     in property <string> empty-text;
@@ -251,6 +596,8 @@ export component MainWindow inherits Window {
     in property <string> hero-sub;
     in property <image> hero-art;
     in property <bool> hero-has-art;
+    /// Toggled off and on by the app when the selection changes, so the hero's entrance replays.
+    in property <bool> hero-shown: true;
     in property <color> hero-tint;
     in property <[PeerRow]> peers;
     in property <string> selected-peer;
@@ -271,6 +618,24 @@ export component MainWindow inherits Window {
     in property <float> t-progress;
     in property <bool> t-indeterminate;
     in property <string> t-file;
+    in property <string> t-speed: "0 MB/s";
+    in property <string> t-speed-sub;
+    in property <string> t-done;
+    in property <string> t-total;
+    in property <string> t-eta: "—";
+    in property <string> t-graph: "M 0 73 L 380 73";
+    in property <string> t-graph-fill: "M 0 74 L 380 74 Z";
+    in property <string> t-from;
+    in property <string> t-to;
+    in property <string> t-from-glyph: "\u{E977}";
+    in property <string> t-to-glyph: "\u{E977}";
+    in property <string> t-link;
+    in property <image> t-art;
+    in property <bool> t-has-art;
+    in property <color> t-tint: #3A4A6A;
+    in property <string> t-initials;
+    out property <color> t-tone: root.t-state == "waiting" || root.t-state == "error" ? Theme.critical : root.t-state == "paused" ? Theme.caution : root.t-state == "ok" ? Theme.success : root.t-state == "cancelled" ? Theme.tertiary : Theme.accent;
+    out property <bool> t-live: root.t-running && !root.t-paused && root.t-state == "";
     in property <bool> t-paused;
     in property <bool> t-running;
     in property <string> log-text;
@@ -283,11 +648,14 @@ export component MainWindow inherits Window {
     callback select-drive(string);
     callback search(string);
     callback refresh();
+    callback set-filter(string);
+    callback add-folder();
     callback add-peer(string);
     callback go();
     callback browse-export();
     callback browse-import();
     callback import-package(string);
+    callback delete-package(string);
     callback pause();
     callback resume();
     callback cancel();
@@ -296,8 +664,19 @@ export component MainWindow inherits Window {
     callback hide-install();
     callback chip-action(string);
     callback about();
+    callback settings();
 
     property <bool> log-open;
+
+    // ambient accent glow behind the header — static, so it costs nothing per frame
+    Rectangle {
+        x: -260px; y: -360px; width: 1000px; height: 720px;
+        background: @radial-gradient(circle, Theme.accent.with-alpha(Theme.dark ? 0.13 : 0.10) 0%, Theme.accent.with-alpha(0) 70%);
+    }
+    Rectangle {
+        x: parent.width - 520px; y: parent.height - 380px; width: 800px; height: 600px;
+        background: @radial-gradient(circle, #9B6BFF.with-alpha(Theme.dark ? 0.07 : 0.05) 0%, #9B6BFF00 70%);
+    }
 
     VerticalLayout {
         // ===== status strip =====
@@ -368,7 +747,27 @@ export component MainWindow inherits Window {
                         Rectangle { horizontal-stretch: 1; }
                     }
                     LineEdit { width: 260px; horizontal-stretch: 0; placeholder-text: "Search games"; edited(t) => { root.search(t); } }
+                    Button { text: "Add game folder…"; horizontal-stretch: 0; clicked => { root.add-folder(); } }
                     Button { text: "Refresh"; horizontal-stretch: 0; clicked => { root.refresh(); } }
+                }
+                if root.filters.length > 0: HorizontalLayout {
+                    spacing: 6px; alignment: start;
+                    for fl in root.filters: Rectangle {
+                        property <bool> on: root.selected-filter == fl.id;
+                        horizontal-stretch: 0;
+                        height: 28px;
+                        width: fl-text.preferred-width + 24px;
+                        border-radius: 14px;
+                        background: self.on ? Palette.accent-background : fl-ta.has-hover ? Theme.subtle : Theme.card;
+                        animate background { duration: 200ms; easing: ease-out-quart; }
+                        border-color: Theme.card-stroke; border-width: self.on ? 0px : 1px;
+                        transform-origin: { x: self.width / 2, y: self.height / 2 };
+                        transform-scale-x: fl-ta.pressed ? 95% : 100%;
+                        transform-scale-y: fl-ta.pressed ? 95% : 100%;
+                        animate transform-scale-x, transform-scale-y { duration: 160ms; easing: ease-out-back; }
+                        fl-text := Text { text: fl.label; font-size: 12px; font-weight: 600; color: parent.on ? Palette.accent-foreground : Palette.foreground; }
+                        fl-ta := TouchArea { mouse-cursor: pointer; clicked => { root.set-filter(fl.id); } }
+                    }
                 }
                 Rectangle {
                     vertical-stretch: 1;
@@ -383,27 +782,64 @@ export component MainWindow inherits Window {
                             y: Math.floor(i / games-view.cols) * games-view.cell-h;
                             width: games-view.cell-w;
                             height: games-view.cell-h;
-                            Art {
-                                x: 8px; y: tile-ta.has-hover && root.selected-game != g.app-id ? 2px : 6px;
-                                width: 152px; height: 228px;
-                                art: g.art; has-art: g.has-art; initials: g.initials; tint: g.tint;
-                                animate y { duration: 120ms; }
+                            // tiles cascade in (rise + fade), staggered left-to-right, top-to-bottom
+                            Reveal {
+                                width: parent.width; height: parent.height;
+                                delay: Math.min(i, 24) * 28ms;
+                                rise: 22px;
+                                // the cover lifts and grows slightly on hover, shadow deepens
+                                Art {
+                                    x: 8px;
+                                    y: tile-ta.has-hover ? 1px : 6px;
+                                    width: 152px; height: 228px;
+                                    art: g.art; has-art: g.has-art; initials: g.initials; tint: g.tint;
+                                    transform-origin: { x: self.width / 2, y: self.height / 2 };
+                                    transform-scale-x: tile-ta.has-hover ? 103% : 100%;
+                                    transform-scale-y: tile-ta.has-hover ? 103% : 100%;
+                                    drop-shadow-blur: tile-ta.has-hover ? 26px : 10px;
+                                    drop-shadow-offset-y: tile-ta.has-hover ? 12px : 4px;
+                                    drop-shadow-color: tile-ta.has-hover ? #00000099 : #00000055;
+                                    animate y, transform-scale-x, transform-scale-y { duration: 260ms; easing: ease-out-quart; }
+                                    animate drop-shadow-blur, drop-shadow-offset-y, drop-shadow-color { duration: 300ms; easing: ease-out-quart; }
+                                }
+                                // selection ring springs into place
+                                Rectangle {
+                                    x: 4px; y: 2px; width: 160px; height: 236px; border-radius: 11px;
+                                    border-width: 3px; border-color: Palette.accent-background;
+                                    opacity: root.selected-game == g.app-id ? 1 : 0;
+                                    transform-origin: { x: self.width / 2, y: self.height / 2 };
+                                    transform-scale-x: root.selected-game == g.app-id ? 100% : 94%;
+                                    transform-scale-y: root.selected-game == g.app-id ? 100% : 94%;
+                                    animate opacity { duration: 220ms; easing: ease-out-quart; }
+                                    animate transform-scale-x, transform-scale-y { duration: 380ms; easing: ease-out-back; }
+                                }
+                                if g.needs-update: Rectangle {
+                                    x: 16px; y: 14px; width: 52px; height: 16px; border-radius: 4px; background: Theme.caution;
+                                    Text { text: "UPDATE"; font-size: 10px; font-weight: 700; color: black; }
+                                }
+                                // check badge pops in
+                                Rectangle {
+                                    x: 128px; y: 14px; width: 24px; height: 24px; border-radius: 12px; background: Palette.accent-background;
+                                    drop-shadow-blur: 8px; drop-shadow-color: #00000066;
+                                    transform-origin: { x: self.width / 2, y: self.height / 2 };
+                                    transform-scale-x: root.selected-game == g.app-id ? 100% : 0%;
+                                    transform-scale-y: root.selected-game == g.app-id ? 100% : 0%;
+                                    animate transform-scale-x, transform-scale-y { duration: 360ms; easing: ease-out-back; }
+                                    Glyph { text: "\u{E73E}"; font-size: 12px; color: Palette.accent-foreground; }
+                                }
+                                if g.badge != "": Rectangle {
+                                    x: 14px; y: 206px; height: 18px; width: badge-text.preferred-width + 12px;
+                                    border-radius: 4px; background: g.badge-color.with-alpha(0.92);
+                                    border-color: #FFFFFF40; border-width: 1px;
+                                    badge-text := Text { text: g.badge; font-size: 10px; font-weight: 700; color: white; }
+                                }
+                                Text {
+                                    x: 10px; y: 242px; width: 148px; text: g.name; font-weight: 600; overflow: elide;
+                                    color: tile-ta.has-hover || root.selected-game == g.app-id ? Palette.foreground : Palette.foreground.with-alpha(0.9);
+                                }
+                                Caption { x: 10px; y: 262px; width: 148px; text: g.meta; }
                             }
-                            Rectangle {
-                                x: 5px; y: 3px; width: 158px; height: 234px; border-radius: 10px;
-                                border-width: root.selected-game == g.app-id ? 3px : 0px; border-color: Palette.accent-background;
-                            }
-                            if g.needs-update: Rectangle {
-                                x: 16px; y: 14px; width: 52px; height: 16px; border-radius: 4px; background: Theme.caution;
-                                Text { text: "UPDATE"; font-size: 10px; font-weight: 700; color: black; }
-                            }
-                            if root.selected-game == g.app-id: Rectangle {
-                                x: 128px; y: 14px; width: 24px; height: 24px; border-radius: 12px; background: Palette.accent-background;
-                                Glyph { text: "\u{E73E}"; font-size: 12px; color: Palette.accent-foreground; }
-                            }
-                            Text { x: 10px; y: 242px; width: 148px; text: g.name; font-weight: 600; overflow: elide; }
-                            Caption { x: 10px; y: 262px; width: 148px; text: g.meta; }
-                            tile-ta := TouchArea { clicked => { root.select-game(g.app-id); } }
+                            tile-ta := TouchArea { mouse-cursor: pointer; clicked => { root.select-game(g.app-id); } }
                         }
                     }
                     if root.games.length == 0: VerticalLayout {
@@ -430,17 +866,36 @@ export component MainWindow inherits Window {
                             Rectangle {
                                 height: 150px; border-radius: 8px; clip: true;
                                 background: root.selected-game == "" ? Theme.card : root.hero-tint;
+                                animate background { duration: 500ms; easing: ease-in-out-sine; }
                                 border-color: Theme.card-stroke; border-width: root.selected-game == "" ? 1px : 0px;
-                                if root.selected-game == "": Text { text: "Pick a game on the left"; color: Theme.secondary; }
-                                if root.selected-game != "" && root.hero-has-art: Image {
-                                    width: parent.width; height: parent.height; source: root.hero-art; image-fit: cover;
+                                if root.selected-game == "": VerticalLayout {
+                                    alignment: center; spacing: 8px;
+                                    Glyph { text: "\u{E7FC}"; font-size: 34px; color: Theme.accent.with-alpha(0.7); }
+                                    Text { text: "Pick a game to send"; font-weight: 600; horizontal-alignment: center; }
+                                    Caption { text: "Its cover and details show up here."; horizontal-alignment: center; }
                                 }
-                                if root.selected-game != "": Rectangle {
-                                    background: @linear-gradient(180deg, #00000000 25%, #000000E0 100%);
-                                    VerticalLayout {
-                                        padding: 14px; alignment: end;
-                                        Text { text: root.hero-title; font-size: 18px; font-weight: 600; color: white; overflow: elide; }
-                                        Text { text: root.hero-sub; font-size: 12px; color: #FFFFFFD0; overflow: elide; }
+                                // re-created on every selection change (the app toggles hero-shown), so its entrance replays
+                                if root.hero-shown && root.selected-game != "": Rectangle {
+                                    if root.hero-has-art: Image {
+                                        property <bool> settled: false;
+                                        init => { self.settled = true; }
+                                        width: parent.width; height: parent.height; source: root.hero-art; image-fit: cover;
+                                        opacity: self.settled ? 1 : 0;
+                                        transform-origin: { x: self.width / 2, y: self.height / 2 };
+                                        transform-scale-x: self.settled ? 100% : 112%;
+                                        transform-scale-y: self.settled ? 100% : 112%;
+                                        animate transform-scale-x, transform-scale-y { duration: 1400ms; easing: ease-out-quint; }
+                                        animate opacity { duration: 500ms; easing: ease-out-quart; }
+                                    }
+                                    Rectangle { background: @linear-gradient(180deg, #00000000 25%, #000000E0 100%); }
+                                    Reveal {
+                                        delay: 120ms;
+                                        rise: 10px;
+                                        VerticalLayout {
+                                            padding: 14px; alignment: end;
+                                            Text { text: root.hero-title; font-size: 18px; font-weight: 600; color: white; overflow: elide; }
+                                            Text { text: root.hero-sub; font-size: 12px; color: #FFFFFFD0; overflow: elide; }
+                                        }
                                     }
                                 }
                             }
@@ -455,8 +910,15 @@ export component MainWindow inherits Window {
                                 height: tips.preferred-height;
                                 tips := VerticalLayout {
                                     padding: 14px; spacing: 8px;
-                                    Text { text: "Looking for other PCs…"; font-weight: 600; }
-                                    ProgressIndicator { indeterminate: true; height: 4px; }
+                                    HorizontalLayout {
+                                        spacing: 12px;
+                                        Radar { }
+                                        VerticalLayout {
+                                            alignment: center; spacing: 2px;
+                                            Text { text: "Looking for other PCs…"; font-weight: 600; }
+                                            Caption { text: "They appear here automatically."; }
+                                        }
+                                    }
                                     Caption { text: "Open Game Transfer on the other PC, then connect them with any of these:"; wrap: word-wrap; overflow: clip; }
                                     if root.show-usb4-tip: HorizontalLayout {
                                         spacing: 10px;
@@ -502,12 +964,35 @@ export component MainWindow inherits Window {
                                     Art { width: 40px; height: 60px; border-radius: 4px; initials-size: 14px; art: pk.art; has-art: pk.has-art; initials: pk.initials; tint: pk.tint; }
                                     VerticalLayout {
                                         alignment: center;
+                                        horizontal-stretch: 1;
                                         Text { text: pk.name; font-weight: 600; overflow: elide; }
                                         Caption { text: pk.subtitle; }
                                     }
                                     VerticalLayout {
                                         alignment: center;
-                                        Button { text: "Install"; enabled: root.packages-enabled; clicked => { root.import-package(pk.folder); } }
+                                        horizontal-stretch: 0;
+                                        Button { text: "Install"; width: 92px; enabled: root.packages-enabled; clicked => { root.import-package(pk.folder); } }
+                                    }
+                                    // delete this copy from the drive (asks first)
+                                    VerticalLayout {
+                                        alignment: center;
+                                        horizontal-stretch: 0;
+                                        Rectangle {
+                                            width: 34px; height: 32px; border-radius: 6px;
+                                            background: del-ta.has-hover && root.packages-enabled ? Theme.critical.with-alpha(0.16) : transparent;
+                                            animate background { duration: 200ms; easing: ease-out-quart; }
+                                            opacity: root.packages-enabled ? 1 : 0.4;
+                                            Glyph {
+                                                text: "\u{E74D}"; font-size: 15px;
+                                                color: del-ta.has-hover && root.packages-enabled ? Theme.critical : Theme.secondary;
+                                                animate color { duration: 200ms; easing: ease-out-quart; }
+                                            }
+                                            del-ta := TouchArea {
+                                                enabled: root.packages-enabled;
+                                                mouse-cursor: pointer;
+                                                clicked => { root.delete-package(pk.folder); }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -519,43 +1004,108 @@ export component MainWindow inherits Window {
                     VerticalLayout {
                         padding: 18px; padding-top: 12px; spacing: 10px;
                         Caption { text: root.summary; wrap: word-wrap; overflow: clip; }
-                        Button { text: root.go-text; primary: true; enabled: root.go-enabled; height: 40px; clicked => { root.go(); } }
+                        PrimaryButton { text: root.go-text; enabled: root.go-enabled; clicked => { root.go(); } }
                     }
                 }
             }
         }
 
-        // ===== transfer =====
+        // ===== transfer: live dashboard =====
         if root.transfer-visible: Rectangle {
-            height: t-card-layout.preferred-height + 16px;
-            Card {
-                x: 20px; y: 10px; width: parent.width - 40px; height: parent.height - 14px;
-                t-card-layout := VerticalLayout {
-                    padding: 16px; padding-top: 12px; padding-bottom: 12px; spacing: 6px;
-                    HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout {
-                            alignment: center;
-                            Text { text: root.t-title; font-size: 14px; font-weight: 600; overflow: elide; }
-                            HorizontalLayout {
-                                spacing: 6px;
-                                property <color> c: root.t-state == "waiting" || root.t-state == "error" ? Theme.critical : root.t-state == "paused" ? Theme.caution : root.t-state == "ok" ? Theme.success : Theme.secondary;
-                                if root.t-state != "": Glyph {
-                                    horizontal-stretch: 0; font-size: 13px; color: parent.c;
-                                    text: root.t-state == "paused" ? "\u{E769}" : root.t-state == "ok" ? "\u{E73E}" : root.t-state == "cancelled" ? "\u{E711}" : "\u{E7BA}";
-                                }
-                                Caption { text: root.t-stats; color: parent.c; }
-                            }
-                        }
-                        Text { text: root.t-percent; font-size: 22px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 0; min-width: 64px; horizontal-alignment: right; }
-                        if root.t-running && !root.t-paused: VerticalLayout { alignment: center; Button { text: "Pause"; clicked => { root.pause(); } } }
-                        if root.t-running && root.t-paused: VerticalLayout { alignment: center; Button { text: "Resume"; primary: true; clicked => { root.resume(); } } }
-                        if root.t-running: VerticalLayout { alignment: center; Button { text: "Cancel"; clicked => { root.cancel(); } } }
-                        if !root.t-running: VerticalLayout { alignment: center; Button { text: "Close"; clicked => { root.close-transfer(); } } }
-                    }
-                    ProgressIndicator { progress: root.t-progress; indeterminate: root.t-indeterminate; height: 6px; }
-                    Caption { text: root.t-file; font-size: 11px; color: Theme.tertiary; font-family: "Cascadia Mono"; }
+            height: 214px;
+            Reveal {
+              rise: 30px;
+              duration: 560ms;
+              Card {
+                x: 20px; y: 8px; width: parent.width - 40px; height: parent.height - 14px;
+                clip: true;
+                drop-shadow-blur: 26px; drop-shadow-color: #00000050; drop-shadow-offset-y: 8px;
+                // soft glow in the transfer's colour, breathing while data moves
+                Rectangle {
+                    x: -120px; y: -160px; width: 520px; height: 420px;
+                    property <float> breath: root.t-live ? (Math.sin(animation-tick() / 1ms * 0.0022 * 1rad) + 1) / 2 : 0.5;
+                    background: @radial-gradient(circle, root.t-tone.with-alpha(0.16 + 0.08 * self.breath) 0%, root.t-tone.with-alpha(0) 70%);
                 }
+                HorizontalLayout {
+                    padding: 18px; spacing: 20px;
+                    // cover
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Art {
+                            width: 112px; height: 168px;
+                            art: root.t-art; has-art: root.t-has-art; initials: root.t-initials; tint: root.t-tint; initials-size: 28px;
+                            drop-shadow-blur: 22px;
+                            drop-shadow-color: root.t-tone.with-alpha(0.45);
+                            drop-shadow-offset-y: 6px;
+                        }
+                    }
+                    // title, route, progress
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 10px;
+                        alignment: center;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                Text { text: root.t-title; font-size: 17px; font-weight: 700; overflow: elide; }
+                                if root.t-stats != "": HorizontalLayout {
+                                    spacing: 6px;
+                                    if root.t-state != "": Glyph {
+                                        horizontal-stretch: 0; font-size: 13px; color: root.t-tone;
+                                        text: root.t-state == "paused" ? "\u{E769}" : root.t-state == "ok" ? "\u{E73E}" : root.t-state == "cancelled" ? "\u{E711}" : "\u{E7BA}";
+                                    }
+                                    Caption { text: root.t-stats; color: root.t-tone; }
+                                }
+                            }
+                            if root.t-running && !root.t-paused: VerticalLayout { alignment: center; Button { text: "Pause"; clicked => { root.pause(); } } }
+                            if root.t-running && root.t-paused: VerticalLayout { alignment: center; Button { text: "Resume"; primary: true; clicked => { root.resume(); } } }
+                            if root.t-running: VerticalLayout { alignment: center; Button { text: "Cancel"; clicked => { root.cancel(); } } }
+                            if !root.t-running: VerticalLayout { alignment: center; Button { text: "Close"; clicked => { root.close-transfer(); } } }
+                        }
+                        RouteFlow {
+                            from: root.t-from; to: root.t-to;
+                            from-glyph: root.t-from-glyph; to-glyph: root.t-to-glyph;
+                            link: root.t-link;
+                            moving: root.t-live;
+                            tone: root.t-tone;
+                        }
+                        Progress {
+                            height: 10px;
+                            progress: root.t-progress;
+                            indeterminate: root.t-indeterminate;
+                            moving: root.t-live;
+                            tone: root.t-tone;
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Caption { text: root.t-file; font-size: 11px; color: Theme.tertiary; font-family: "Cascadia Mono"; horizontal-stretch: 1; }
+                            Text { text: root.t-percent; font-size: 13px; font-weight: 700; horizontal-stretch: 0; color: root.t-tone; }
+                        }
+                    }
+                    // live numbers + graph
+                    VerticalLayout {
+                        width: 380px;
+                        horizontal-stretch: 0;
+                        spacing: 8px;
+                        alignment: center;
+                        HorizontalLayout {
+                            spacing: 18px;
+                            Stat { label: "SPEED NOW"; value: root.t-speed; sub: root.t-speed-sub; big: true; tone: root.t-tone; }
+                            Stat { label: "TRANSFERRED"; value: root.t-done; sub: root.t-total; }
+                            Stat { label: "TIME LEFT"; value: root.t-eta; sub: ""; }
+                        }
+                        SpeedGraph {
+                            width: 380px;
+                            height: 74px;
+                            line: root.t-graph; fill: root.t-graph-fill;
+                            tone: root.t-tone;
+                            live: root.t-live;
+                        }
+                    }
+                }
+              }
             }
         }
 
@@ -572,6 +1122,7 @@ export component MainWindow inherits Window {
         HorizontalLayout {
             padding-left: 20px; padding-right: 20px; padding-top: 4px; padding-bottom: 8px; spacing: 10px;
             Button { text: root.log-open ? "Hide activity" : "Activity"; horizontal-stretch: 0; checkable: true; checked: root.log-open; clicked => { root.log-open = !root.log-open; } }
+            Button { text: "Settings"; horizontal-stretch: 0; clicked => { root.settings(); } }
             Button { text: "About"; horizontal-stretch: 0; clicked => { root.about(); } }
             Caption { text: root.last-log; vertical-alignment: center; horizontal-stretch: 1; }
             Caption { text: root.version; vertical-alignment: center; horizontal-stretch: 0; horizontal-alignment: right; }
@@ -586,18 +1137,31 @@ export component MainWindow inherits Window {
         spacing: 6px;
         for t in root.toasts: Rectangle {
             height: toast-layout.preferred-height;
-            border-radius: 8px;
-            background: Theme.toast-bg;
-            border-color: Theme.card-stroke; border-width: 1px;
-            drop-shadow-blur: 18px; drop-shadow-color: #00000050; drop-shadow-offset-y: 3px;
-            toast-layout := HorizontalLayout {
-                padding: 12px; padding-left: 14px; spacing: 12px;
-                Glyph {
-                    horizontal-stretch: 0; font-size: 16px; vertical-alignment: top;
-                    text: t.kind == "ok" ? "\u{E73E}" : t.kind == "error" ? "\u{E783}" : "\u{E946}";
-                    color: t.kind == "ok" ? Theme.success : t.kind == "error" ? Theme.critical : Palette.accent-background;
+            // slides in from the right edge
+            Reveal {
+                slide: 60px;
+                rise: 0px;
+                duration: 420ms;
+                Rectangle {
+                    border-radius: 8px;
+                    background: Theme.toast-bg;
+                    border-color: Theme.card-stroke; border-width: 1px;
+                    drop-shadow-blur: 22px; drop-shadow-color: #00000060; drop-shadow-offset-y: 6px;
+                    // a coloured edge says what kind of message it is
+                    Rectangle {
+                        x: 0; width: 3px; height: parent.height - 16px; y: 8px; border-radius: 1.5px;
+                        background: t.kind == "ok" ? Theme.success : t.kind == "error" ? Theme.critical : Theme.accent;
+                    }
+                    toast-layout := HorizontalLayout {
+                        padding: 12px; padding-left: 16px; spacing: 12px;
+                        Glyph {
+                            horizontal-stretch: 0; font-size: 16px; vertical-alignment: top;
+                            text: t.kind == "ok" ? "\u{E73E}" : t.kind == "error" ? "\u{E783}" : "\u{E946}";
+                            color: t.kind == "ok" ? Theme.success : t.kind == "error" ? Theme.critical : Palette.accent-background;
+                        }
+                        Text { text: t.text; wrap: word-wrap; }
+                    }
                 }
-                Text { text: t.text; wrap: word-wrap; }
             }
         }
     }

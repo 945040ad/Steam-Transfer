@@ -4,10 +4,13 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod apps;
 mod hardware;
 mod installer;
+mod launchers;
 mod net;
 mod pipeline;
+mod settings;
 mod steam;
 mod transfer;
 mod util;

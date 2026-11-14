@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <!-- aurora: deep blue → violet → magenta -->
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2F6BFF"/>
+      <stop offset="0.55" stop-color="#7B3FF2"/>
+      <stop offset="1" stop-color="#C13BD8"/>
+    </linearGradient>
+    <!-- glassy top light -->
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.30"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.04"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <!-- glow from the lower right, where the motion is heading -->
+    <radialGradient id="glow" cx="0.78" cy="0.82" r="0.6">
+      <stop offset="0" stop-color="#FF9BEA" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#FF9BEA" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="play" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E9DDFF"/>
+    </linearGradient>
+    <filter id="lift" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="6" stdDeviation="7" flood-color="#2A0A66" flood-opacity="0.45"/>
+    </filter>
+    <clipPath id="tile"><rect x="8" y="8" width="240" height="240" rx="58"/></clipPath>
+  </defs>
+
+  <!-- tile -->
+  <rect x="8" y="8" width="240" height="240" rx="58" fill="url(#bg)"/>
+  <g clip-path="url(#tile)">
+    <rect x="8" y="8" width="240" height="240" fill="url(#glow)"/>
+    <rect x="8" y="8" width="240" height="120" fill="url(#sheen)"/>
+  </g>
+  <rect x="9.5" y="9.5" width="237" height="237" rx="56.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="3"/>
+
+  <!-- speed trails: the game is on the move -->
+  <g stroke="#FFFFFF" stroke-linecap="round" filter="url(#lift)">
+    <line x1="44" y1="104" x2="86" y2="104" stroke-width="15" stroke-opacity="0.55"/>
+    <line x1="30" y1="132" x2="86" y2="132" stroke-width="15" stroke-opacity="0.85"/>
+    <line x1="52" y1="160" x2="86" y2="160" stroke-width="15" stroke-opacity="0.4"/>
+  </g>
+
+  <!-- the game: a bold, rounded play symbol -->
+  <path d="M112 78 L112 186 L204 132 Z" fill="url(#play)" stroke="url(#play)" stroke-width="30" stroke-linejoin="round" filter="url(#lift)"/>
+</svg>

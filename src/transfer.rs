@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::launchers::Launcher;
 use crate::steam::{self, Game, Library};
 use crate::util;
 
@@ -39,11 +40,30 @@ pub struct Offer {
     pub total_bytes: u64,
     pub dirs: Vec<String>,
     pub files: Vec<FileEntry>,
+    /// Launcher id ("steam", "epic", "gog", ... — older versions omit it, meaning Steam).
+    pub launcher: String,
+    /// Launcher install records needed to register the game on the receiving PC (e.g. Epic's manifest).
+    pub meta: serde_json::Value,
+    /// Folder name for non-Steam games (the receiver creates it under the chosen parent folder).
+    pub folder: String,
+    /// Drive packages only: files that compress are stored as `<path>.zst` (zstd), the rest as-is.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub packed: bool,
 }
 
 impl Default for Offer {
     fn default() -> Self {
-        Offer { version: 1, app_id: String::new(), name: String::new(), from: String::new(), total_bytes: 0, dirs: vec![], files: vec![] }
+        Offer { version: 1, app_id: String::new(), name: String::new(), from: String::new(), total_bytes: 0, dirs: vec![], files: vec![], launcher: String::new(), meta: serde_json::Value::Null, folder: String::new(), packed: false }
+    }
+}
+
+impl Offer {
+    pub fn launcher(&self) -> Launcher {
+        Launcher::from_id(&self.launcher)
+    }
+    /// Steam offers use library-relative `steamapps/...` paths; all others are relative to the game folder.
+    pub fn is_steam(&self) -> bool {
+        self.launcher() == Launcher::Steam
     }
 }
 
@@ -192,7 +212,10 @@ impl std::error::Error for CancelledError {}
 
 /// Everything that makes up an installed game, manifests last so Steam never sees a half-copied game.
 pub fn build_offer(g: &Game) -> io::Result<Offer> {
-    let mut offer = Offer { app_id: g.app_id.clone(), name: g.name.clone(), from: util::machine_name(), ..Default::default() };
+    if !g.is_steam() {
+        return build_folder_offer(g);
+    }
+    let mut offer = Offer { app_id: g.app_id.clone(), name: g.name.clone(), from: util::machine_name(), launcher: Launcher::Steam.id().into(), ..Default::default() };
     let root = &g.library.path;
 
     let add_tree = |rel: String, offer: &mut Offer| -> io::Result<()> {
@@ -227,23 +250,63 @@ pub fn build_offer(g: &Game) -> io::Result<Offer> {
     Ok(offer)
 }
 
+/// A non-Steam game: every file in its folder, paths relative to that folder.
+fn build_folder_offer(g: &Game) -> io::Result<Offer> {
+    let root = &g.library.path;
+    if !root.is_dir() {
+        return Err(io::Error::other(format!("Game folder not found: {}", root.display())));
+    }
+    let mut offer = Offer {
+        app_id: g.app_id.clone(),
+        name: g.name.clone(),
+        from: util::machine_name(),
+        launcher: g.launcher.id().into(),
+        meta: g.meta.clone(),
+        folder: g.install_dir.clone(),
+        ..Default::default()
+    };
+    // apps: the staging folder is made of junctions (follow them) and caches stay behind
+    let app = g.launcher == Launcher::App;
+    let walk = walkdir::WalkDir::new(root).min_depth(1).follow_links(app).into_iter().filter_entry(|e| {
+        !(app && e.file_type().is_dir() && crate::apps::CACHE_DIRS.contains(&e.file_name().to_string_lossy().to_lowercase().as_str()))
+    });
+    for e in walk {
+        let e = e.map_err(io::Error::other)?;
+        let r = rel_path(root, e.path());
+        if e.file_type().is_dir() {
+            offer.dirs.push(r);
+        } else if e.file_type().is_file() {
+            let md = e.metadata().map_err(io::Error::other)?;
+            offer.files.push(FileEntry { path: r, size: md.len(), mtime: util::to_ticks(md.modified()?) });
+        }
+    }
+    if offer.files.is_empty() {
+        return Err(io::Error::other(format!("No files found in {}", root.display())));
+    }
+    offer.total_bytes = offer.files.iter().map(|f| f.size).sum();
+    Ok(offer)
+}
+
 fn rel_path(root: &Path, full: &Path) -> String {
     full.strip_prefix(root).unwrap_or(full).to_string_lossy().replace('\\', "/")
 }
 
-pub fn is_manifest(rel: &str) -> bool {
-    rel.to_ascii_lowercase().ends_with(".acf")
+/// Steam manifests are written last (so Steam never sees a half-copied game). Other launchers have none here.
+pub fn is_manifest(rel: &str, steam: bool) -> bool {
+    steam && rel.to_ascii_lowercase().ends_with(".acf")
 }
 
-/// Resolve a relative path from a peer or package, refusing anything outside the Steam game folders.
-pub fn safe_combine(root: &Path, rel: &str) -> io::Result<PathBuf> {
+/// Resolve a relative path from a peer or package. Steam: only the game folders inside a Steam library are allowed
+/// (the library root also holds steam.exe). Other launchers: anything inside the game's own folder.
+pub fn safe_combine(root: &Path, rel: &str, steam: bool) -> io::Result<PathBuf> {
     let r = rel.replace('\\', "/");
     let lower = r.to_ascii_lowercase();
     let bad = || io::Error::new(io::ErrorKind::InvalidData, format!("Refusing unexpected path: {rel}"));
-    if r.split('/').any(|seg| seg == ".." || seg == "." || seg.contains(':')) {
+    if r.is_empty() || r.starts_with('/') || r.split('/').any(|seg| seg.is_empty() || seg == ".." || seg == "." || seg.contains(':')) {
         return Err(bad());
     }
-    let allowed = lower.starts_with("steamapps/common/")
+    let allowed = !steam
+        || lower.starts_with("steamapps/common/")
         || lower.starts_with("steamapps/workshop/")
         || (lower.starts_with("steamapps/appmanifest_") && !lower[10..].contains('/'));
     if !allowed {
@@ -262,9 +325,9 @@ pub fn compute_skip(offer: &Offer, dest_root: &Path) -> Vec<usize> {
         .files
         .iter()
         .enumerate()
-        .filter(|(_, f)| !is_manifest(&f.path))
+        .filter(|(_, f)| !is_manifest(&f.path, offer.is_steam()))
         .filter(|(_, f)| {
-            safe_combine(dest_root, &f.path)
+            safe_combine(dest_root, &f.path, offer.is_steam())
                 .ok()
                 .and_then(|p| fs::metadata(p).ok())
                 .is_some_and(|md| md.len() == f.size && md.modified().is_ok_and(|m| (util::to_ticks(m) - f.mtime).abs() <= MTIME_TOLERANCE_TICKS))
@@ -275,7 +338,7 @@ pub fn compute_skip(offer: &Offer, dest_root: &Path) -> Vec<usize> {
 
 pub fn create_dirs(offer: &Offer, dest_root: &Path) -> io::Result<()> {
     for d in &offer.dirs {
-        fs::create_dir_all(safe_combine(dest_root, d)?)?;
+        fs::create_dir_all(safe_combine(dest_root, d, offer.is_steam())?)?;
     }
     Ok(())
 }
@@ -361,9 +424,9 @@ pub fn big_workers_for(paths: &[&Path]) -> usize {
     if paths.iter().any(|p| crate::hardware::is_hdd(p)) { 1 } else { 4 }
 }
 
-pub(crate) fn create_dest(f: &FileEntry, dest_root: &Path, durable: bool) -> io::Result<(File, PathBuf, PathBuf)> {
-    let dest = safe_combine(dest_root, &f.path)?;
-    let tmp = if is_manifest(&f.path) { PathBuf::from(format!("{}.steamtransfer.tmp", dest.display())) } else { dest.clone() };
+pub(crate) fn create_dest(f: &FileEntry, dest_root: &Path, steam: bool, durable: bool) -> io::Result<(File, PathBuf, PathBuf)> {
+    let dest = safe_combine(dest_root, &f.path, steam)?;
+    let tmp = if is_manifest(&f.path, steam) { PathBuf::from(format!("{}.steamtransfer.tmp", dest.display())) } else { dest.clone() };
     let write_through = durable && durability() == Durability::WriteThrough;
     let open = || {
         use std::os::windows::fs::OpenOptionsExt;
@@ -410,16 +473,16 @@ pub(crate) fn finish_dest(out: File, f: &FileEntry, dest: &Path, tmp: &Path, flu
 /// Write one file streamed from `src` (used for big files and manifests).
 /// `flush`: force data onto the device before the file counts as done (for drives that may be yanked).
 /// `added` receives the bytes counted into progress, so a failed attempt can be taken back.
-pub fn write_file(src: &mut (impl Read + ?Sized), f: &FileEntry, dest_root: &Path, p: &Progress, flush: bool, added: &mut u64) -> io::Result<()> {
+pub fn write_file(src: &mut (impl Read + ?Sized), f: &FileEntry, dest_root: &Path, steam: bool, p: &Progress, flush: bool, added: &mut u64) -> io::Result<()> {
     p.set_current(&f.path);
-    let (mut out, dest, tmp) = create_dest(f, dest_root, flush)?;
+    let (mut out, dest, tmp) = create_dest(f, dest_root, steam, flush)?;
     pump(src, &mut out, f.size, p, added)?;
     finish_dest(out, f, &dest, &tmp, flush)
 }
 
 /// Write one small file whose contents are already in memory. Progress is counted by the caller.
-pub fn write_bytes(data: &[u8], f: &FileEntry, dest_root: &Path, flush: bool) -> io::Result<()> {
-    let (mut out, dest, tmp) = create_dest(f, dest_root, flush)?;
+pub fn write_bytes(data: &[u8], f: &FileEntry, dest_root: &Path, steam: bool, flush: bool) -> io::Result<()> {
+    let (mut out, dest, tmp) = create_dest(f, dest_root, steam, flush)?;
     out.write_all(data)?;
     finish_dest(out, f, &dest, &tmp, flush)
 }
@@ -505,16 +568,179 @@ fn retry_local(p: &Progress, roots: &[&Path], log: &(dyn Fn(String) + Sync), ste
     }
 }
 
+// ---------------- compressed drive packages ----------------
+
+/// How a local copy treats drive-package files.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Packing {
+    /// Byte-for-byte.
+    Plain,
+    /// Writing a package: files that compress are stored as `<path>.zst`.
+    Compress,
+    /// Reading a package: `<path>.zst` files are decompressed.
+    Decompress,
+}
+
+/// zstd level for packages: 3 compresses ~600 MB/s per core (faster than any USB drive writes with a few cores
+/// busy) and decompresses at ~1.6 GB/s. Higher levels save only 1–4 % more (measured on Silksong: 7.64 GB →
+/// 2.23 GB at level 1, 2.13 GB at 3, 1.98 GB at 19, which is ~100× slower).
+pub fn pack_level() -> i32 {
+    std::env::var("STEAMXFER_PACK_LEVEL").ok().and_then(|v| v.parse().ok()).unwrap_or(3)
+}
+const PACK_EXT: &str = ".zst";
+
+pub fn packed_name(rel: &str) -> String {
+    format!("{rel}{PACK_EXT}")
+}
+
+/// Worth storing compressed: saves at least 3 %.
+fn packs_well(raw: usize, packed: usize) -> bool {
+    (packed as f64) < raw as f64 * 0.97
+}
+
+/// Expected packed size / raw size, from 24 random 1 MB samples across the game (weighted by file size).
+pub fn estimate_ratio(offer: &Offer, root: &Path) -> f64 {
+    let steam = offer.is_steam();
+    let files: Vec<&FileEntry> = offer.files.iter().filter(|f| f.size > 0 && !is_manifest(&f.path, steam)).collect();
+    let total: u64 = files.iter().map(|f| f.size).sum();
+    if total == 0 {
+        return 1.0;
+    }
+    let mut seed = 0x2545F4914F6CDD1Du64;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let (mut raw, mut packed) = (0usize, 0usize);
+    let mut buf = vec![0u8; 1024 * 1024];
+    for _ in 0..24 {
+        let mut target = rnd() % total;
+        let Some(f) = files.iter().find(|f| if target < f.size { true } else { target -= f.size; false }) else { continue };
+        let Ok(mut file) = safe_combine(root, &f.path, steam).and_then(|p| open_read(&p)) else { continue };
+        let off = if f.size > buf.len() as u64 { rnd() % (f.size - buf.len() as u64) } else { 0 };
+        use std::io::Seek;
+        if file.seek(io::SeekFrom::Start(off)).is_err() {
+            continue;
+        }
+        let Ok(n) = file.read(&mut buf) else { continue };
+        if n == 0 {
+            continue;
+        }
+        let z = zstd::bulk::compress(&buf[..n], pack_level()).map(|z| z.len()).unwrap_or(n);
+        raw += n;
+        packed += if packs_well(n, z) { z } else { n };
+    }
+    if raw == 0 { 1.0 } else { packed as f64 / raw as f64 }
+}
+
+/// Like compute_skip, for a package being written: a finished `<path>.zst` counts when its timestamp matches
+/// (its size differs from the original by design; unfinished ones are still named `.zst.partial`).
+pub fn compute_skip_packed(offer: &Offer, data_root: &Path) -> Vec<usize> {
+    let steam = offer.is_steam();
+    let raw: std::collections::HashSet<usize> = compute_skip(offer, data_root).into_iter().collect();
+    let same_time = |md: fs::Metadata, f: &FileEntry| md.modified().is_ok_and(|m| (util::to_ticks(m) - f.mtime).abs() <= MTIME_TOLERANCE_TICKS);
+    (0..offer.files.len())
+        .filter(|i| {
+            let f = &offer.files[*i];
+            raw.contains(i) || (!is_manifest(&f.path, steam) && safe_combine(data_root, &packed_name(&f.path), steam).ok().and_then(|p| fs::metadata(p).ok()).is_some_and(|md| same_time(md, f)))
+        })
+        .collect()
+}
+
+/// Store one file in a package: compressed (`<path>.zst`) if its first 4 MB shrink, otherwise as-is.
+/// The first chunk is written as its own zstd frame and the rest streamed as a second one (a valid .zst).
+fn pack_one(f: &FileEntry, src_root: &Path, dest_root: &Path, steam: bool, p: &Progress, flush: bool) -> io::Result<()> {
+    let mut src = open_read(&safe_combine(src_root, &f.path, steam)?)?;
+    if src.metadata()?.len() != f.size {
+        return Err(io::Error::other(format!("File changed size since the copy started: {}", f.path)));
+    }
+    let raw_dest = safe_combine(dest_root, &f.path, steam)?;
+    let zst_dest = safe_combine(dest_root, &packed_name(&f.path), steam)?;
+    let mut first = vec![0u8; f.size.min(BUF_SIZE as u64) as usize];
+    src.read_exact(&mut first)?;
+    let z = zstd::bulk::compress(&first, pack_level())?;
+    let mut added = 0u64;
+    let r = (|| {
+        if !first.is_empty() && packs_well(first.len(), z.len()) {
+            let _ = fs::remove_file(&raw_dest); // never both forms
+            let part = FileEntry { path: format!("{}.partial", packed_name(&f.path)), size: 0, mtime: f.mtime };
+            let (out, part_path, _) = create_dest(&part, dest_root, steam, flush)?;
+            let mut out = io::BufWriter::with_capacity(1024 * 1024, out);
+            out.write_all(&z)?;
+            p.add(first.len() as u64);
+            added += first.len() as u64;
+            let rest = f.size - first.len() as u64;
+            let out = if rest > 0 {
+                let mut enc = zstd::stream::Encoder::new(out, pack_level())?;
+                pump(&mut src, &mut enc, rest, p, &mut added)?;
+                enc.finish()?
+            } else {
+                out
+            };
+            let out = out.into_inner().map_err(|e| e.into_error())?;
+            finish_dest(out, f, &zst_dest, &part_path, flush)
+        } else {
+            let _ = fs::remove_file(&zst_dest);
+            let mut chained = io::Cursor::new(first).chain(src);
+            write_file(&mut chained, f, dest_root, steam, p, flush, &mut added)
+        }
+    })();
+    if r.is_err() {
+        p.sub(added);
+    }
+    r
+}
+
+/// Restore one file from its `<path>.zst` in a package.
+fn unpack_one(f: &FileEntry, zst: &Path, dest_root: &Path, steam: bool, p: &Progress, flush: bool) -> io::Result<()> {
+    let mut added = 0u64;
+    let r = (|| {
+        if f.size < SMALL_FILE {
+            let mut comp = Vec::new();
+            open_read(zst)?.read_to_end(&mut comp)?;
+            let data = zstd::stream::decode_all(&comp[..])?;
+            if data.len() as u64 != f.size {
+                return Err(io::Error::other(format!("{} is damaged on the drive (wrong size after unpacking).", f.path)));
+            }
+            write_bytes(&data, f, dest_root, steam, flush)?;
+            p.add(f.size);
+            added = f.size;
+            Ok(())
+        } else {
+            let mut dec = zstd::stream::Decoder::new(open_read(zst)?)?;
+            write_file(&mut dec, f, dest_root, steam, p, flush, &mut added)
+        }
+    })();
+    if r.is_err() {
+        p.sub(added);
+    }
+    r
+}
+
 /// Copy one file between drives; progress of a failed attempt is taken back.
-fn copy_one(f: &FileEntry, src_root: &Path, dest_root: &Path, p: &Progress, flush: bool) -> io::Result<()> {
-    let src_path = safe_combine(src_root, &f.path)?;
-    if f.size < SMALL_FILE && !is_manifest(&f.path) {
+fn copy_one(f: &FileEntry, src_root: &Path, dest_root: &Path, steam: bool, p: &Progress, flush: bool, mode: Packing) -> io::Result<()> {
+    if !is_manifest(&f.path, steam) {
+        match mode {
+            Packing::Compress => return pack_one(f, src_root, dest_root, steam, p, flush),
+            Packing::Decompress => {
+                let zst = safe_combine(src_root, &packed_name(&f.path), steam)?;
+                if zst.is_file() {
+                    return unpack_one(f, &zst, dest_root, steam, p, flush);
+                }
+            }
+            Packing::Plain => {}
+        }
+    }
+    let src_path = safe_combine(src_root, &f.path, steam)?;
+    if f.size < SMALL_FILE && !is_manifest(&f.path, steam) {
         let mut data = Vec::with_capacity(f.size as usize);
         open_read(&src_path)?.read_to_end(&mut data)?;
         if data.len() as u64 != f.size {
             return Err(io::Error::other(format!("File changed size since the copy started: {}", f.path)));
         }
-        write_bytes(&data, f, dest_root, flush)?;
+        write_bytes(&data, f, dest_root, steam, flush)?;
         p.add(f.size);
         return Ok(());
     }
@@ -523,7 +749,7 @@ fn copy_one(f: &FileEntry, src_root: &Path, dest_root: &Path, p: &Progress, flus
         return Err(io::Error::other(format!("File changed size since the copy started: {}", f.path)));
     }
     let mut added = 0;
-    let r = write_file(&mut src, f, dest_root, p, flush, &mut added);
+    let r = write_file(&mut src, f, dest_root, steam, p, flush, &mut added);
     if r.is_err() {
         p.sub(added); // take back a failed attempt's progress before the retry
     }
@@ -533,8 +759,8 @@ fn copy_one(f: &FileEntry, src_root: &Path, dest_root: &Path, p: &Progress, flus
 /// Parallel copy between drives: one worker streams the big files in order (kind to HDDs and USB sticks)
 /// while a pool handles small files concurrently, so per-file overhead overlaps. If either drive is unplugged,
 /// the affected files wait for it and are redone from the start (half-written files on a yanked drive can't be trusted).
-fn copy_local_parallel(offer: &Offer, src_root: &Path, dest_root: &Path, p: &Progress, log: &(dyn Fn(String) + Sync), flush: bool) -> io::Result<()> {
-    let skip: std::collections::HashSet<usize> = compute_skip(offer, dest_root).into_iter().collect();
+fn copy_local_parallel(offer: &Offer, src_root: &Path, dest_root: &Path, p: &Progress, log: &(dyn Fn(String) + Sync), flush: bool, mode: Packing) -> io::Result<()> {
+    let skip: std::collections::HashSet<usize> = if mode == Packing::Compress { compute_skip_packed(offer, dest_root) } else { compute_skip(offer, dest_root) }.into_iter().collect();
     p.total.store(offer.files.iter().enumerate().filter(|(i, _)| !skip.contains(i)).map(|(_, f)| f.size).sum(), Ordering::Relaxed);
     if !skip.is_empty() {
         log(format!("{} files already present, skipping them.", skip.len()));
@@ -542,28 +768,34 @@ fn copy_local_parallel(offer: &Offer, src_root: &Path, dest_root: &Path, p: &Pro
     let roots = [src_root, dest_root];
     retry_local(p, &roots, log, &mut || create_dirs(offer, dest_root))?;
 
-    let todo = (0..offer.files.len()).filter(|i| !skip.contains(i) && !is_manifest(&offer.files[*i].path));
+    let steam = offer.is_steam();
+    let todo = (0..offer.files.len()).filter(|i| !skip.contains(i) && !is_manifest(&offer.files[*i].path, steam));
     let (big, small): (Vec<usize>, Vec<usize>) = todo.partition(|&i| offer.files[i].size >= SMALL_FILE);
     let big = Mutex::new(std::collections::VecDeque::from(big));
     let small = Mutex::new(std::collections::VecDeque::from(small));
     let failure: Mutex<Option<io::Error>> = Mutex::new(None);
     let stop = AtomicBool::new(false);
     let workers = workers_for(&roots);
-    let big_workers = big_workers_for(&roots);
+    let mut big_workers = big_workers_for(&roots);
+    if mode == Packing::Compress && big_workers > 1 && std::env::var_os("STEAMXFER_BIG_WORKERS").is_none() {
+        // compressing is CPU work: more files at once (Silksong → USB SSD: 4 workers 17.6 s, 12 workers 11.6 s,
+        // flat beyond). Hard drives keep one.
+        big_workers = std::thread::available_parallelism().map(|n| n.get() / 2).unwrap_or(4).clamp(4, 12);
+    }
 
     std::thread::scope(|scope| {
         for worker in 0..workers + big_workers {
             let (big, small, failure, stop, roots) = (&big, &small, &failure, &stop, &roots);
             scope.spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    // the first ig_workers own the big files, then help with small ones
+                    // the first big_workers own the big files, then help with small ones
                     let next = if worker < big_workers { big.lock().unwrap().pop_front().or_else(|| small.lock().unwrap().pop_front()) } else { small.lock().unwrap().pop_front() };
                     let Some(idx) = next else { break };
                     let f = &offer.files[idx];
                     if f.size >= SMALL_FILE {
                         p.set_current(&f.path);
                     }
-                    if let Err(e) = retry_local(p, roots, log, &mut || copy_one(f, src_root, dest_root, p, flush)) {
+                    if let Err(e) = retry_local(p, roots, log, &mut || copy_one(f, src_root, dest_root, steam, p, flush, mode)) {
                         failure.lock().unwrap().get_or_insert(e);
                         stop.store(true, Ordering::Relaxed);
                     }
@@ -575,8 +807,8 @@ fn copy_local_parallel(offer: &Offer, src_root: &Path, dest_root: &Path, p: &Pro
         return Err(e);
     }
     // Manifests last, so Steam never sees a half-copied game.
-    for f in offer.files.iter().enumerate().filter(|(i, f)| !skip.contains(i) && is_manifest(&f.path)).map(|(_, f)| f) {
-        retry_local(p, &roots, log, &mut || copy_one(f, src_root, dest_root, p, flush))?;
+    for f in offer.files.iter().enumerate().filter(|(i, f)| !skip.contains(i) && is_manifest(&f.path, steam)).map(|(_, f)| f) {
+        retry_local(p, &roots, log, &mut || copy_one(f, src_root, dest_root, steam, p, flush, mode))?;
     }
     Ok(())
 }
@@ -585,25 +817,95 @@ fn copy_local_parallel(offer: &Offer, src_root: &Path, dest_root: &Path, p: &Pro
 pub fn export(g: &Game, target: &Path, p: &Progress, log: &(dyn Fn(String) + Sync)) -> io::Result<PathBuf> {
     let offer = build_offer(g)?;
     let safe: String = g.name.chars().map(|c| if r#"<>:"/\|?*"#.contains(c) || c.is_control() { '_' } else { c }).collect();
-    let pkg = target.join("SteamTransfer").join(format!("{} - {}", g.app_id, safe.trim()));
+    let id = if g.is_steam() { g.app_id.clone() } else { format!("{}-{}", g.launcher.id(), g.app_id) };
+    let pkg = target.join("SteamTransfer").join(format!("{} - {}", sanitize(&id), safe.trim()));
     fs::create_dir_all(&pkg)?;
     let marker = pkg.join(PACKAGE_FILE);
     let _ = fs::remove_file(&marker); // incomplete until rewritten at the end
 
-    let have: u64 = compute_skip(&offer, &pkg).iter().map(|&i| offer.files[i].size).sum();
-    let need = offer.total_bytes - have;
+    let mut offer = offer;
+    let data = package_data(&offer, &pkg);
+    // Compress when it pays (Unity/indie games often shrink 3×; most AAA games ship already compressed).
+    let ratio = if std::env::var("STEAMXFER_PACK").as_deref() == Ok("0") { 1.0 } else { estimate_ratio(&offer, &g.library.path) };
+    offer.packed = ratio < 0.9;
+    let have: u64 = if offer.packed { compute_skip_packed(&offer, &data) } else { compute_skip(&offer, &data) }.iter().map(|&i| offer.files[i].size).sum();
+    let need = if offer.packed { ((offer.total_bytes - have) as f64 * (ratio + 0.08).min(1.0)) as u64 } else { offer.total_bytes - have };
+    if offer.packed {
+        log(format!("{} compresses well: about {} on the drive instead of {}.", g.name, util::size((offer.total_bytes as f64 * ratio) as u64), util::size(offer.total_bytes)));
+    }
     let free = util::free_space(&pkg);
     if free < need {
         return Err(io::Error::other(format!("Not enough space on the drive: need {}, have {}.", util::size(need), util::size(free))));
     }
-    copy_local_parallel(&offer, &g.library.path, &pkg, p, log, true)?;
+    copy_local_parallel(&offer, &g.library.path, &data, p, log, true, if offer.packed { Packing::Compress } else { Packing::Plain })?;
     fs::write(&marker, serde_json::to_vec(&offer)?)?;
     Ok(pkg)
 }
 
 /// Install a package folder (from a drive) into a local library.
+/// Install a package folder (from a drive). `lib.path`: the Steam library, or for other launchers the game folder.
 pub fn import(offer: &Offer, package: &Path, lib: &Library, p: &Progress, log: &(dyn Fn(String) + Sync)) -> io::Result<()> {
-    copy_local_parallel(offer, package, &lib.path, p, log, false)
+    copy_local_parallel(offer, &package_data(offer, package), &lib.path, p, log, false, if offer.packed { Packing::Decompress } else { Packing::Plain })
+}
+
+/// Where a package keeps its files: Steam packages mirror a library (`steamapps/...`); other games live in `game\`
+/// (so a game file can never collide with the package's own transfer.json).
+pub fn package_data(offer: &Offer, package: &Path) -> PathBuf {
+    if offer.is_steam() { package.to_path_buf() } else { package.join("game") }
+}
+
+fn sanitize(s: &str) -> String {
+    s.chars().map(|c| if r#"<>:"/\|?*"#.contains(c) || c.is_control() { '_' } else { c }).collect()
+}
+
+/// Delete a game copy from a drive. Only what the package itself lists is removed (its files, then its now-empty
+/// folders, then transfer.json — compressed .zst forms included); anything else on the drive — including the app copy next to it — is left alone.
+/// Returns the bytes freed.
+pub fn delete_package(folder: &Path) -> io::Result<u64> {
+    let is_root = folder.parent().is_none() || util::drive_of(folder).as_path() == folder.components().collect::<PathBuf>().as_path();
+    if is_root {
+        return Err(io::Error::other("Refusing to delete a whole drive."));
+    }
+    let offer = read_package(folder)?;
+    let data = package_data(&offer, folder);
+    let steam = offer.is_steam();
+    let remove = |p: &Path| -> io::Result<()> {
+        match fs::remove_file(p) {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                let mut perms = fs::metadata(p)?.permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(false);
+                fs::set_permissions(p, perms)?;
+                fs::remove_file(p)
+            }
+            r => r,
+        }
+    };
+    let mut freed = 0;
+    for f in &offer.files {
+        for rel in [f.path.clone(), packed_name(&f.path), format!("{}.partial", packed_name(&f.path))] {
+            let Ok(p) = safe_combine(&data, &rel, steam) else { continue };
+            if let Ok(md) = fs::symlink_metadata(&p) {
+                if md.is_file() {
+                    remove(&p)?;
+                    freed += md.len();
+                }
+            }
+        }
+    }
+    // folders, deepest first; remove_dir only succeeds on empty ones, so unknown content keeps its folder
+    let mut dirs: Vec<PathBuf> = offer.dirs.iter().filter_map(|d| safe_combine(&data, d, steam).ok()).collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for d in dirs {
+        let _ = fs::remove_dir(d);
+    }
+    let layout: &[&str] = if steam { &[r"steamapps\workshop\content", r"steamapps\workshop", r"steamapps\common", "steamapps"] } else { &["game"] };
+    for d in layout {
+        let _ = fs::remove_dir(folder.join(d));
+    }
+    remove(&folder.join(PACKAGE_FILE))?;
+    let _ = fs::remove_dir(folder);
+    Ok(freed)
 }
 
 pub fn read_package(folder: &Path) -> io::Result<Offer> {
@@ -616,12 +918,22 @@ mod tests {
     #[test]
     fn path_safety() {
         let root = Path::new(r"C:\lib");
-        assert!(safe_combine(root, "steamapps/common/Game/a.pak").is_ok());
-        assert!(safe_combine(root, "steamapps/appmanifest_10.acf").is_ok());
-        assert!(safe_combine(root, "steamapps/common/../../steam.exe").is_err());
-        assert!(safe_combine(root, "Windows/evil.dll").is_err());
-        assert!(safe_combine(root, "steamapps/common/C:/x").is_err());
-        assert!(safe_combine(root, "steamapps/appmanifest_x/../../a").is_err());
+        assert!(safe_combine(root, "steamapps/common/Game/a.pak", true).is_ok());
+        assert!(safe_combine(root, "steamapps/appmanifest_10.acf", true).is_ok());
+        assert!(safe_combine(root, "steamapps/common/../../steam.exe", true).is_err());
+        assert!(safe_combine(root, "Windows/evil.dll", true).is_err());
+        assert!(safe_combine(root, "steam.exe", true).is_err());
+        assert!(safe_combine(root, "steamapps/common/C:/x", true).is_err());
+        assert!(safe_combine(root, "steamapps/appmanifest_x/../../a", true).is_err());
+        // other launchers: anything inside the game folder, nothing outside it
+        let game = Path::new(r"D:\Games\Epic Games\Fortnite");
+        assert!(safe_combine(game, "FortniteGame/Binaries/x.exe", false).is_ok());
+        assert!(safe_combine(game, ".egstore/1.manifest", false).is_ok());
+        assert!(safe_combine(game, "../Other/x", false).is_err());
+        assert!(safe_combine(game, "a/../../x", false).is_err());
+        assert!(safe_combine(game, "/etc/x", false).is_err());
+        assert!(safe_combine(game, "C:/Windows/x", false).is_err());
+        assert!(safe_combine(game, "a//b", false).is_err());
     }
     #[test]
     fn wire_format_is_pascal_case() {

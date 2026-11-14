@@ -1,6 +1,6 @@
 [package]
 name = "steam-transfer"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "Copy installed Steam games between Windows PCs over USB4/Thunderbolt, Ethernet, Wi-Fi or a USB drive."
 repository = "https://github.com/945040ad/Steam-Transfer"
@@ -23,7 +23,7 @@ slint = "1.18.1"
 socket2 = "0.6.5"
 sysinfo = "0.40.3"
 walkdir = "2.5.0"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_SystemInformation", "Win32_System_Registry"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_SystemInformation", "Win32_System_Registry", "Win32_System_IO"] }
 winreg = "0.56.0"
 wmi = "0.18.4"
 zstd = "0.14.4"

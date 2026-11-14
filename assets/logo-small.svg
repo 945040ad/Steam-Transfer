@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- 16–32 px: same tile and play symbol, one thick trail, no fine detail -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2F6BFF"/>
+      <stop offset="0.55" stop-color="#7B3FF2"/>
+      <stop offset="1" stop-color="#C13BD8"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="248" height="248" rx="60" fill="url(#bg)"/>
+  <line x1="28" y1="128" x2="68" y2="128" stroke="#FFFFFF" stroke-width="30" stroke-linecap="round" stroke-opacity="0.85"/>
+  <path d="M120 70 L120 186 L212 128 Z" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="34" stroke-linejoin="round"/>
+</svg>

@@ -200,7 +200,7 @@ fn read_at(file: &mut File, path: &Path, f: &FileEntry, buf: &mut [u8], pos: u64
 #[allow(clippy::too_many_arguments)]
 fn send_range(w: &mut impl Write, plan: &SendPlan, idx: usize, off: u64, len: u64, p: &Progress, log: &(dyn Fn(String) + Sync)) -> io::Result<()> {
     let f = &plan.offer.files[idx];
-    let path = transfer::safe_combine(plan.root, &f.path)?;
+    let path = transfer::safe_combine(plan.root, &f.path, plan.offer.is_steam())?;
     p.set_current(&f.path);
     let mut file = open_waiting(&path, p, log)?;
     if !plan.wire.v2 {
@@ -274,7 +274,7 @@ pub fn send_files(streams: Vec<TcpStream>, plan: &SendPlan, p: &Progress, log: &
                     let next = small.lock().unwrap().pop_front();
                     let Some(idx) = next else { break };
                     let f = &offer.files[idx];
-                    let item = transfer::safe_combine(plan.root, &f.path).and_then(|path| transfer::read_small(&path, f, p, log)).map(|data| {
+                    let item = transfer::safe_combine(plan.root, &f.path, plan.offer.is_steam()).and_then(|path| transfer::read_small(&path, f, p, log)).map(|data| {
                         let mut packed = Vec::new();
                         if plan.wire.v2 && plan.comp.encode(idx, &data, &mut packed) {
                             Ready { idx, raw_len: data.len(), payload: packed }
@@ -407,7 +407,7 @@ impl<'a> Receiver<'a> {
                     if self.received.lock().unwrap().contains(&idx) {
                         return Err(bad("Peer sent a file twice."));
                     }
-                    let (file, dest, tmp) = transfer::create_dest(f, self.dest, false)?;
+                    let (file, dest, tmp) = transfer::create_dest(f, self.dest, self.offer.is_steam(), false)?;
                     let p = Arc::new(Partial { file: Mutex::new(Some(file)), dest, tmp, remaining: Mutex::new(f.size) });
                     map.insert(idx, p.clone());
                     p
@@ -449,7 +449,7 @@ impl<'a> Receiver<'a> {
                 return Ok(());
             }
             let idx = idx as usize;
-            if !self.expected.contains(&idx) || transfer::is_manifest(&self.offer.files[idx].path) != manifests {
+            if !self.expected.contains(&idx) || transfer::is_manifest(&self.offer.files[idx].path, self.offer.is_steam()) != manifests {
                 return Err(bad("Peer sent an unexpected file."));
             }
             let f = &self.offer.files[idx];
@@ -464,7 +464,7 @@ impl<'a> Receiver<'a> {
                         p.checkpoint()?;
                         tx.send((idx, bytes)).map_err(|_| io::Error::other("file writers stopped"))?;
                     }
-                    _ => transfer::write_file(s, f, self.dest, p, false, &mut 0)?,
+                    _ => transfer::write_file(s, f, self.dest, self.offer.is_steam(), p, false, &mut 0)?,
                 }
                 continue;
             }
@@ -486,7 +486,7 @@ impl<'a> Receiver<'a> {
                 self.mark_received(idx)?;
                 match pool {
                     Some(tx) if f.size < SMALL_FILE => tx.send((idx, data)).map_err(|_| io::Error::other("file writers stopped"))?,
-                    _ => transfer::write_bytes(&data, f, self.dest, false)?,
+                    _ => transfer::write_bytes(&data, f, self.dest, self.offer.is_steam(), false)?,
                 }
             } else {
                 p.set_current(&f.path);
@@ -514,7 +514,7 @@ impl<'a> Receiver<'a> {
                         let Ok((idx, bytes)) = job else { break };
                         // after a failure keep draining so the network threads never block
                         if failure.lock().unwrap().is_none() {
-                            if let Err(e) = transfer::write_bytes(&bytes, &self.offer.files[idx], self.dest, false) {
+                            if let Err(e) = transfer::write_bytes(&bytes, &self.offer.files[idx], self.dest, self.offer.is_steam(), false) {
                                 fail(e);
                             }
                         }

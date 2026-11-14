@@ -20,7 +20,9 @@ Get `SteamTransfer.exe` from the [Releases](../../releases) page. Run it on **bo
 2. Connect the PCs: a USB4/Thunderbolt cable (fastest), an Ethernet cable (direct or through a router), or the same Wi-Fi.
 3. Pick a game, pick the other PC, click **Send**. On the other PC, choose a Steam library and click **Accept**.
 
-**With a USB drive or external SSD:** pick the drive under *Copy to a drive*. The app copies itself onto the drive too. On the other PC, open `SteamTransfer\SteamTransfer.exe` from the drive; the game appears under *Install from a drive*.
+**With a USB drive or external SSD:** pick the drive under *Copy to a drive*. On the other PC, open `SteamTransfer\SteamTransfer.exe` from the drive; the game appears under *Install from a drive* (the trash icon deletes a copy from the drive).
+
+The app keeps a working copy of itself on the drive: every copy to or install from a drive puts `SteamTransfer.exe` back if it was deleted, moved off the drive, cut short or is older, so the next person can always run it from there. Turn this off in *Settings*.
 
 | Connection | Typical speed | Notes |
 |---|---|---|
@@ -29,7 +31,36 @@ Get `SteamTransfer.exe` from the [Releases](../../releases) page. Run it on **bo
 | Wi-Fi | slower | Works; compression helps a lot here. |
 | USB drive / SSD | drive speed | Measured ≈360 MB/s to a USB 3.1 SSD. |
 
-The receiving PC's Steam account must own the game to play it.
+The receiving PC's account (Steam, Epic, …) must own the game to play it.
+
+## Supported launchers
+
+| Launcher | Found automatically | On the receiving PC |
+|---|---|---|
+| **Steam** | Steam libraries | **Automatic** — shows up as installed after Steam restarts |
+| **Epic Games** | Epic's install manifests | **Automatic** — registered with the Epic Games Launcher (DLC included) |
+| **GOG Galaxy** | GOG registry entries | Galaxy → *Add games → Scan and import folders* (GOG games also run DRM-free) |
+| **EA app** | EA / Origin registry entries | EA app → game → *Install → Locate* |
+| **Ubisoft Connect** | Ubisoft install records | Game page → *Locate installed game* |
+| **Battle.net** | Blizzard uninstall entries | Game → *Locate the game* |
+| **Rockstar Games Launcher** | Rockstar uninstall entries | *Settings → My installed games → Locate* |
+| **Anything else** | *Add game folder…* | Copied as a plain folder |
+
+For launchers with a "locate" step, the app shows the exact steps (with the folder path) when the copy finishes; the launcher then checks the files instead of downloading them again. Non-Steam games go into a folder you choose (suggested: next to that launcher's other games, or `C:\Games\<launcher>`).
+
+Not supported: Microsoft Store / Xbox (Game Pass) games — Windows encrypts and locks them in a protected folder.
+
+## Windows apps
+
+Programs installed **for your Windows account** (Discord, Slack, Spotify, Obsidian, Notion, VS Code user setup, Zed, Brave/Chrome per-user, ...) show up under **Apps** and transfer like games, with:
+
+- the program folder, **and** its settings/data folders in `%AppData%` / `%LocalAppData%` (plus e.g. `~\.vscode` for VS Code), minus caches;
+- its registry settings (`HKCU` only, user-profile paths rewritten for the receiving user);
+- its Start-menu and desktop shortcuts.
+
+It lands in the same place inside the receiving user's profile. No administrator rights needed. If the app is running, you're asked to close it first. The receiver only accepts the app's own folders and registry keys (never Windows' folders, the Startup folder, `Run` keys or file associations).
+
+Not yet: apps installed for all users (Program Files) — they need administrator rights, services and machine-wide registry entries.
 
 ## Performance
 
@@ -37,7 +68,8 @@ Measured on a laptop (Intel Core Ultra, NVMe, USB 3.1 SSD), every transfer verif
 
 | Scenario | Before tuning | Now |
 |---|---|---|
-| Silksong (7.6 GB) to a USB SSD | 108 MB/s | **360 MB/s** (drive limit ≈374) |
+| Silksong (7.6 GB) to a USB SSD | 108 MB/s, 7.6 GB on the drive | **12 s, 2.18 GB on the drive** (compressed package) |
+| Silksong installed from that SSD | 34 s | **3.6–5 s** (reads 2.2 GB instead of 7.6) |
 | 20,000 small files to a USB SSD | 17.9 MB/s | **47.8 MB/s** |
 | Silksong over a 1 Gbps link (simulated) | 75 s | **23 s** (compression) |
 | One 2 GB file over the network | 578–699 MB/s | **≈1 GB/s** (split across connections) |
@@ -47,6 +79,7 @@ How:
 - **Many small files** — reader and writer thread pools (32 on SSDs) overlap each file's open/close/antivirus-scan latency; 1 MB socket buffers batch tiny files into big writes.
 - **Huge files** — split into 64 MB ranges spread over every connection, so one giant archive uses the whole link.
 - **Adaptive compression (zstd)** — only on links under 5 Gbps; a file is sent raw once a chunk doesn't shrink, and compression switches off for already-compressed games (most AAA titles), so they cost no extra CPU.
+- **Compressed drive packages** — like Steam's own downloads: files that shrink are stored as zstd (`.zst`) on the drive, the rest as-is. Many games (Unity/indie) ship uncompressed and get 3–4× smaller, so copying to and installing from a drive is that much less to write and read. A quick sample decides up front; already-compressed games are stored plain at no CPU cost.
 - **USB drives** — files are written with `FILE_FLAG_WRITE_THROUGH`, so a finished file survives an unplug without a per-file cache-flush command (1.9× faster for small files). Several big files are written at once.
 - **Hard drives** — detected automatically; fewer workers and sequential reads to avoid seek thrashing.
 
@@ -75,6 +108,7 @@ Environment switches for experiments: `STEAMXFER_THROTTLE_MBPS` (simulate a link
 | File | What |
 |---|---|
 | `src/steam.rs`, `src/vdf.rs` | Steam libraries, app manifests, cover-art cache, closing/restarting Steam |
+| `src/launchers.rs` | Epic, GOG, EA, Ubisoft, Battle.net, Rockstar and folder games: detection, Epic registration, locate steps |
 | `src/transfer.rs` | File plan, copy pump, pause/cancel, resume, USB-drive packages, unplugged-drive recovery |
 | `src/pipeline.rs` | Parallel data plane: read-ahead/writer pools, range splitting, compression, wire formats |
 | `src/net.rs` | PC discovery (UDP broadcast on every adapter), firewall rule, control protocol |

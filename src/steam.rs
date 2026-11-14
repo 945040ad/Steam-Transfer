@@ -26,6 +26,8 @@ impl Library {
     }
 }
 
+/// An installed game from any launcher. For Steam, `library` is the Steam library and paths in an offer are
+/// relative to it (`steamapps/...`); for every other launcher `library.path` is the game's own folder.
 #[derive(Clone, Debug)]
 pub struct Game {
     pub app_id: String,
@@ -34,11 +36,21 @@ pub struct Game {
     pub size_on_disk: u64,
     pub state_flags: u32,
     pub library: Library,
+    pub launcher: crate::launchers::Launcher,
+    /// Launcher-specific install records needed to register the game on the other PC (e.g. Epic's manifest).
+    pub meta: serde_json::Value,
 }
 
 impl Game {
     pub fn fully_installed(&self) -> bool {
         self.state_flags == 4
+    }
+    pub fn is_steam(&self) -> bool {
+        self.launcher == crate::launchers::Launcher::Steam
+    }
+    /// The folder holding the game's files.
+    pub fn install_path(&self) -> PathBuf {
+        if self.is_steam() { self.library.steamapps().join("common").join(&self.install_dir) } else { self.library.path.clone() }
     }
 }
 
@@ -122,6 +134,8 @@ fn read_manifest(acf: &Path, lib: &Library) -> Option<Game> {
         app_id,
         install_dir,
         library: lib.clone(),
+        launcher: crate::launchers::Launcher::Steam,
+        meta: serde_json::Value::Null,
     })
 }
 

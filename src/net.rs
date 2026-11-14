@@ -24,6 +24,10 @@ const MAGIC: &str = "STEAMXFER2";
 const MAX_STREAMS: i32 = 8;
 /// Negotiated protocol extension: framed chunks (big files split across connections) + zstd compression.
 const FEATURE_V2: &str = "v2-frames-zstd";
+/// Negotiated: the receiver understands non-Steam games (Epic, GOG, EA, Ubisoft, ... and plain folders).
+const FEATURE_LAUNCHERS: &str = "launchers";
+/// Negotiated: the receiver can install Windows apps (junction staging, registry, shortcuts).
+const FEATURE_APPS: &str = "apps";
 
 pub fn tcp_port() -> u16 {
     TCP_PORT.load(Ordering::Relaxed)
@@ -259,7 +263,7 @@ pub fn send(game: &Game, to: Ipv4Addr, p: &Arc<Progress>, log: &(dyn Fn(String) 
     log(format!("{} files, {}. Connecting to {to} via {via}...", offer.files.len(), util::size(offer.total_bytes)));
 
     let mut control = connect(to, p)?;
-    send_msg(&mut control, &Hello { offer: Some(offer.clone()), streams: want, session: None, features: vec![FEATURE_V2.into()] })?;
+    send_msg(&mut control, &Hello { offer: Some(offer.clone()), streams: want, session: None, features: vec![FEATURE_V2.into(), FEATURE_LAUNCHERS.into(), FEATURE_APPS.into()] })?;
     p.set_current("waiting for the other PC to accept");
     log("Waiting for the other PC to accept...".into());
     let reply: Reply = read_msg(&mut control)?;
@@ -267,13 +271,22 @@ pub fn send(game: &Game, to: Ipv4Addr, p: &Arc<Progress>, log: &(dyn Fn(String) 
         return Err(io::Error::other(format!("Transfer declined: {}", reply.reason.unwrap_or("rejected by other PC".into()))));
     }
 
+    if !offer.is_steam() && !reply.features.iter().any(|f| f == FEATURE_LAUNCHERS) {
+        return Err(io::Error::other(format!(
+            "The other PC runs an older version that can only receive Steam games. Update it to send {} games.",
+            offer.launcher().name()
+        )));
+    }
+    if offer.launcher() == crate::launchers::Launcher::App && !reply.features.iter().any(|f| f == FEATURE_APPS) {
+        return Err(io::Error::other("The other PC runs an older version that can't install apps. Update it first."));
+    }
     let skip: HashSet<usize> = reply.skip.iter().copied().collect();
     let todo: Vec<usize> = (0..offer.files.len()).filter(|i| !skip.contains(i)).collect();
     p.total.store(todo.iter().map(|&i| offer.files[i].size).sum(), Ordering::Relaxed);
     if !skip.is_empty() {
         log(format!("Other PC already has {} files, skipping them.", skip.len()));
     }
-    let (manifests, files): (Vec<usize>, Vec<usize>) = todo.into_iter().partition(|&i| transfer::is_manifest(&offer.files[i].path));
+    let (manifests, files): (Vec<usize>, Vec<usize>) = todo.into_iter().partition(|&i| transfer::is_manifest(&offer.files[i].path, offer.is_steam()));
 
     let wire = Wire { v2: reply.features.iter().any(|f| f == FEATURE_V2) };
     let source_hdd = crate::hardware::is_hdd(&game.library.path);
@@ -332,6 +345,10 @@ fn compression_wanted(to: Ipv4Addr, bps: u64) -> bool {
 pub struct Decision {
     pub library: Library,
     pub close_steam: bool,
+    /// Apps: the receiving staging folder (junctions into this user's profile); unlinked when dropped.
+    /// Only held, never read: it must live until the files are written.
+    #[allow(dead_code)]
+    pub staging: Option<Arc<crate::apps::Staging>>,
 }
 
 pub enum JobEnd {
@@ -341,15 +358,29 @@ pub enum JobEnd {
     Declined,
 }
 
+/// Where a transfer goes, for the live transfer view: endpoints and how they're connected.
+#[derive(Clone, Debug, Default)]
+pub struct Route {
+    pub from: String,
+    pub to: String,
+    /// "pc", "usb4", "ethernet", "wifi" or "drive"
+    pub from_kind: String,
+    pub to_kind: String,
+    /// Game name and cover-art key (Steam app id, empty for other launchers).
+    pub game: String,
+    pub art_id: String,
+}
+
 /// What the transfer engine needs from the UI.
 pub trait Host: Send + Sync {
     fn log(&self, msg: String);
     /// None if another transfer is running.
-    fn begin_job(&self, title: String) -> Option<Arc<Progress>>;
+    fn begin_job(&self, title: String, route: Route) -> Option<Arc<Progress>>;
     fn end_job(&self, end: JobEnd);
     /// Blocks until the user decides.
     fn ask_accept(&self, offer: &Offer, from: String) -> Option<Decision>;
-    fn after_receive(&self, offer: &Offer, steam_was_closed: bool);
+    /// `dest`: the Steam library, or for other launchers the game folder.
+    fn after_receive(&self, offer: &Offer, dest: &std::path::Path, steam_was_closed: bool);
 }
 
 pub struct Server {
@@ -392,7 +423,15 @@ impl Server {
     fn handle_offer(&self, mut control: TcpStream, offer: Offer, want: i32, wire: Wire) {
         let host = &self.host;
         let from = control.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-        let Some(p) = host.begin_job(format!("Receiving {}", offer.name)) else {
+        let route = Route {
+            from: offer.from.clone(),
+            to: "This PC".into(),
+            from_kind: control.peer_addr().ok().and_then(|a| match a.ip() { IpAddr::V4(ip) => Some(route_to(ip).2.to_string()), _ => None }).unwrap_or("ethernet".into()),
+            to_kind: "pc".into(),
+            game: offer.name.clone(),
+            art_id: if offer.is_steam() { offer.app_id.clone() } else { String::new() },
+        };
+        let Some(p) = host.begin_job(format!("Receiving {}", offer.name), route) else {
             let _ = send_msg(&mut control, &Reply { accept: false, reason: Some("the other PC is busy with another transfer".into()), ..Default::default() });
             return;
         };
@@ -423,7 +462,10 @@ impl Server {
             let streams = want.clamp(1, MAX_STREAMS);
             let (tx, rx) = mpsc::channel();
             self.sessions.lock().unwrap().insert(session.clone(), tx);
-            let features = if wire.v2 { vec![FEATURE_V2.to_string()] } else { vec![] };
+            let mut features = vec![FEATURE_LAUNCHERS.to_string(), FEATURE_APPS.to_string()];
+            if wire.v2 {
+                features.push(FEATURE_V2.to_string());
+            }
             send_msg(&mut control, &Reply { accept: true, skip: skip.clone(), session: Some(session.clone()), streams, reason: None, features })?;
             host.log(format!(
                 "Receiving into {} over {streams} stream{}{}",
@@ -449,8 +491,14 @@ impl Server {
         match result {
             Ok(false) => host.end_job(JobEnd::Declined),
             Ok(true) => {
+                let dest = root.clone().unwrap_or_default();
+                if !offer.is_steam() {
+                    if let Err(e) = crate::launchers::register(offer.launcher(), &offer.meta, &dest, &log) {
+                        host.log(format!("Couldn't register the game with {}: {e}", offer.launcher().name()));
+                    }
+                }
                 host.end_job(JobEnd::Done(format!("Received {}.", offer.name)));
-                host.after_receive(&offer, closed_steam);
+                host.after_receive(&offer, &dest, closed_steam);
             }
             Err(e) => {
                 let mut msg = e.to_string();

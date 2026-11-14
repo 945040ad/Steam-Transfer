@@ -97,18 +97,73 @@ pub fn uninstall() {
     message("Steam Game Transfer was removed.");
 }
 
-/// Puts a copy of the app on a drive so the other PC can run it straight from there.
-pub fn copy_app_to(folder: &Path) {
+/// What `ensure_app_copy` found or did.
+#[derive(Debug, PartialEq)]
+pub enum AppCopy {
+    /// An identical copy is already there (or the app is running from that very file).
+    Present,
+    /// There was none (deleted or moved away): a fresh copy was put there.
+    Copied,
+    /// There was a damaged, partial or older copy: replaced.
+    Updated,
+    /// A newer version of the app is already there: left alone.
+    NewerThere,
+}
+
+/// Makes sure a working copy of this app is at `folder\SteamTransfer.exe`, so whoever gets the drive next can run it
+/// straight from there — even if the copy was deleted, cut/moved off the drive, cut short or is an older version.
+/// The copy is written to a temporary file first and renamed into place, so pulling the drive out mid-copy never
+/// leaves a broken exe behind.
+pub fn ensure_app_copy(folder: &Path) -> std::io::Result<AppCopy> {
+    let me = current_exe();
     let dest = folder.join("SteamTransfer.exe");
-    if same_path(&dest, &current_exe()) {
-        return;
+    if same_path(&dest, &me) {
+        return Ok(AppCopy::Present);
     }
-    let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).ok();
-    if len(&dest).is_some() && len(&dest) == len(&current_exe()) {
-        return;
+    let existed = dest.is_file();
+    if existed {
+        let same = std::fs::metadata(&dest)?.len() == std::fs::metadata(&me)?.len() && std::fs::read(&dest)? == std::fs::read(&me)?;
+        if same {
+            return Ok(AppCopy::Present);
+        }
+        if let (Some(theirs), Some(mine)) = (exe_version(&dest), exe_version(&me)) {
+            if theirs > mine {
+                return Ok(AppCopy::NewerThere);
+            }
+        }
     }
-    let _ = std::fs::create_dir_all(folder);
-    let _ = std::fs::copy(current_exe(), dest);
+    std::fs::create_dir_all(folder)?;
+    let tmp = folder.join("SteamTransfer.exe.partial");
+    std::fs::copy(&me, &tmp)?;
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e); // e.g. someone is running the copy on the drive right now
+    }
+    Ok(if existed { AppCopy::Updated } else { AppCopy::Copied })
+}
+
+/// File version from an exe's version resource, e.g. (2, 1, 0, 0).
+pub fn exe_version(path: &Path) -> Option<(u16, u16, u16, u16)> {
+    use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW};
+    let w = wide(&path.to_string_lossy());
+    unsafe {
+        let size = GetFileVersionInfoSizeW(w.as_ptr(), std::ptr::null_mut());
+        if size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        if GetFileVersionInfoW(w.as_ptr(), 0, size, buf.as_mut_ptr().cast()) == 0 {
+            return None;
+        }
+        let root = wide("\\");
+        let mut info: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut len = 0u32;
+        if VerQueryValueW(buf.as_ptr().cast(), root.as_ptr(), &mut info, &mut len) == 0 || info.is_null() || (len as usize) < std::mem::size_of::<VS_FIXEDFILEINFO>() {
+            return None;
+        }
+        let f = &*(info as *const VS_FIXEDFILEINFO);
+        Some(((f.dwFileVersionMS >> 16) as u16, f.dwFileVersionMS as u16, (f.dwFileVersionLS >> 16) as u16, f.dwFileVersionLS as u16))
+    }
 }
 
 fn create_shortcut(lnk: &Path, target: &Path) {
